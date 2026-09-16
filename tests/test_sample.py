@@ -82,3 +82,27 @@ def test_sample_limit_is_capped() -> None:
     for bad in ("0", "101"):
         with pytest.raises(SystemExit):
             parser.parse_args(["sample", "--limit", bad])
+
+
+async def test_sample_prints_any_language_through_a_non_utf8_pipe(
+    repository: SQLiteEventRepository,
+) -> None:
+    # Regression: on Windows stdout defaulted to cp1252 and a real GDELT quote with U+2060
+    # crashed the command when its output was piped.
+    import subprocess
+    import sys
+
+    quote = item(SourceType.GDELT, 1, "gdelt:gqg").model_copy(
+        update={"original_text": "Word⁠joiner, кириллица and 中文 in one quote"}
+    )
+    await repository.add_events([build_candidate(quote)])
+    env = {**os.environ, "PYTHONIOENCODING": "cp1252"}
+    result = subprocess.run(  # noqa: ASYNC221 - a short child process in a test
+        [sys.executable, "-m", "qmemo_radar", "sample", "--db", str(repository._db_path)],
+        capture_output=True,
+        env=env,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+    [row] = json.loads(result.stdout.decode("utf-8"))["items"]
+    assert row["text"] == "Word⁠joiner, кириллица and 中文 in one quote"

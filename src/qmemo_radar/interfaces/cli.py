@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import itertools
 import json
+import sys
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -284,6 +285,8 @@ def _sample_items() -> list[RawSourceItem]:
 
 def main() -> None:
     args = build_parser().parse_args()
+    # JSON output carries text from any language; a Windows console or pipe defaults to cp1252.
+    sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
     raise SystemExit(
         asyncio.run(
             execute(
