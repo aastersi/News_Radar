@@ -2,7 +2,7 @@ import hashlib
 import re
 import unicodedata
 from datetime import UTC, datetime
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import unquote_plus, urlsplit, urlunsplit
 
 from pydantic import HttpUrl
 
@@ -35,14 +35,15 @@ def canonicalize_url(value: str) -> str:
     host = parts.hostname.lower() if parts.hostname else ""
     if host == "twitter.com" or host == "www.twitter.com":
         host = "x.com"
+    if ":" in host:
+        host = f"[{host}]"  # IPv6 literal
     if parts.port:
         host = f"{host}:{parts.port}"
-    query = urlencode(
-        [
-            (key, item)
-            for key, item in parse_qsl(parts.query, keep_blank_values=True)
-            if key.lower() not in _TRACKING_PARAMETERS
-        ]
+    # Parameters keep their original encoding: re-encoding could lengthen or break a valid URL.
+    query = "&".join(
+        pair
+        for pair in parts.query.split("&")
+        if pair and unquote_plus(pair.split("=", 1)[0]).lower() not in _TRACKING_PARAMETERS
     )
     return urlunsplit((parts.scheme.lower(), host, parts.path.rstrip("/"), query, ""))
 
