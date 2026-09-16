@@ -22,6 +22,27 @@ x:
   # Сколько страниц читать по каждому запросу за один сбор (1-10). Повышайте только для узких запросов.
   max_pages_per_query: 1
 
+# RSS/Atom — бесплатно, без ключей. Каждая включённая лента — отдельный источник rss:<name>
+# со своим checkpoint (ETag/Last-Modified). name: латиница в нижнем регистре, цифры, _ (до 40).
+# Читается только сама лента: без JavaScript, без загрузки страниц статей, до 5 МБ на ответ.
+# Адреса лент и их редиректы должны вести в публичный интернет (localhost и частные сети отклоняются).
+rss:
+  feeds:
+    - name: bbc_world
+      url: https://feeds.bbci.co.uk/news/world/rss.xml
+      enabled: true
+    - name: npr_news
+      url: https://feeds.npr.org/1001/rss.xml
+      enabled: true
+    - name: verge          # Atom
+      url: https://www.theverge.com/rss/index.xml
+      enabled: true
+    - name: hn_frontpage
+      url: https://hnrss.org/frontpage
+      enabled: false
+
+# GDELT Global Quotation Graph настраивается в .env (RADAR_GDELT_*), не здесь.
+
 # Публикации этих авторов (handle или числовой id) всегда отбрасываются.
 blocked_authors: []
 
