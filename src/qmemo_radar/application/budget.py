@@ -69,9 +69,17 @@ class BudgetGuard:
                 estimated_cost_usd=cost_usd,
                 created_at=now,
             )
-            reserved = await self._ledger.reserve_cost(
-                entry, since=month_start(now), limit_usd=self.hard_limit_usd
-            )
+            try:
+                reserved = await self._ledger.reserve_cost(
+                    entry, since=month_start(now), limit_usd=self.hard_limit_usd
+                )
+            except Exception as exc:
+                # A locked or broken ledger must block the call, not let it through.
+                logger.warning(
+                    "cost ledger unavailable",
+                    extra={**log, "result": "blocked", "error_code": type(exc).__name__},
+                )
+                raise BudgetBlocked("ledger_unavailable") from exc
             if reserved is not None:
                 entry_id, month_total = reserved
                 if month_total > self.target_usd:
@@ -85,7 +93,14 @@ class BudgetGuard:
         raise BudgetBlocked(code)
 
     async def settle(self, entry_id: int, *, units: int, cost_usd: Decimal) -> None:
-        await self._ledger.settle_cost(entry_id, units=units, cost_usd=cost_usd)
+        try:
+            await self._ledger.settle_cost(entry_id, units=units, cost_usd=cost_usd)
+        except Exception as exc:
+            # The larger reservation simply stays, which errs on the expensive side.
+            logger.warning(
+                "cost settle failed",
+                extra={"operation": "budget:settle", "error_code": type(exc).__name__},
+            )
 
     async def spent_this_month(self) -> Decimal:
         return await self._ledger.cost_since(month_start(self._clock()))

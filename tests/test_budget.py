@@ -1,6 +1,7 @@
 """BudgetGuard and the cost ledger: paid calls fail closed before any HTTP request."""
 
 import asyncio
+import sqlite3
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -193,3 +194,130 @@ async def test_concurrent_reservations_cannot_overspend(
     assert results.count(True) == 3
     assert await guard.spent_this_month() == Decimal("0.9")
 
+
+
+class Script:
+    """Answers X or LLM requests from a list; an exception entry simulates a lost response."""
+
+    def __init__(self, *answers: httpx.Response | Exception) -> None:
+        self.answers = list(answers)
+        self.requests: list[httpx.Request] = []
+
+    def http(self, base_url: str) -> httpx.AsyncClient:
+        return httpx.AsyncClient(base_url=base_url, transport=httpx.MockTransport(self.handler))
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        answer = self.answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+
+async def _no_sleep(seconds: float) -> None:
+    return None
+
+
+def _page(post_id: str, *, next_token: str | None = None) -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "data": [
+                {
+                    "id": post_id,
+                    "text": "A founder promised a public launch date this week.",
+                    "author_id": "u1",
+                    "created_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                }
+            ],
+            "meta": {"newest_id": post_id, **({"next_token": next_token} if next_token else {})},
+        },
+    )
+
+
+async def test_every_retry_is_reserved_and_only_answered_errors_are_refunded(
+    repository: SQLiteEventRepository,
+) -> None:
+    guard = BudgetGuard(
+        repository, enabled=frozenset(PaidFeature), hard_limit_usd=Decimal(10), target_usd=0
+    )
+    post_id = snowflake(minutes_ago=1)
+    script = Script(httpx.Response(503), httpx.ReadTimeout("lost"), _page(post_id))
+    x = XApiClient(script.http("https://api.x.com"), guard=guard, sleep=_no_sleep)
+
+    await search(x)
+
+    with sqlite3.connect(repository._db_path) as db:
+        costs = [row[0] for row in db.execute("SELECT estimated_cost_micros FROM cost_ledger")]
+    # 503: no resources returned, refunded. Timeout: may have been served, kept. 200: 1 post.
+    assert costs == [0, 1_500_000, 5_000]
+    assert len(script.requests) == 3
+
+
+async def test_llm_retry_needs_its_own_reservation(repository: SQLiteEventRepository) -> None:
+    guard = BudgetGuard(
+        repository, enabled=frozenset(PaidFeature), hard_limit_usd=Decimal("0.05"), target_usd=0
+    )
+    script = Script(httpx.Response(503), httpx.Response(503))
+    llm = ChatCompletionsClient(
+        script.http("https://llm.test/v1"),
+        model="m",
+        guard=guard,
+        cost_per_call_usd=Decimal("0.03"),
+        sleep=_no_sleep,
+    )
+
+    with pytest.raises(BudgetBlocked, match="hard_limit_reached"):
+        await llm.complete(CHAT, max_tokens=10)
+    assert len(script.requests) == 1  # the retry was refused before it was sent
+
+
+async def test_budget_stop_on_a_later_page_keeps_the_pages_already_paid(
+    repository: SQLiteEventRepository,
+) -> None:
+    guard = BudgetGuard(
+        repository, enabled=frozenset(PaidFeature), hard_limit_usd=Decimal("1.60"), target_usd=0
+    )
+    post_id = snowflake(minutes_ago=1)
+    script = Script(_page(post_id, next_token="t2"))
+    x = XApiClient(script.http("https://api.x.com"), guard=guard, sleep=_no_sleep)
+    # $0.10 spent: the first $1.50 worst-case page fits exactly; after it settles to $0.005,
+    # the second page ($0.105 + $1.50) crosses the $1.60 limit.
+    earlier = CostEntry(
+        provider="t",
+        operation="t",
+        units=1,
+        estimated_cost_usd=Decimal("0.10"),
+        created_at=datetime.now(UTC),
+    )
+    await repository.reserve_cost(earlier, since=SINCE, limit_usd=Decimal(10))
+
+    items, newest = await x.search_recent(
+        "q", source_key="query:q", since_id=None, start_time=None, max_pages=3
+    )
+
+    assert [item.external_id for item in items] == [post_id] and newest == post_id
+    assert len(script.requests) == 1
+
+
+class BrokenLedger:
+    async def reserve_cost(self, *args: Any, **kwargs: Any) -> tuple[int, Decimal] | None:
+        raise sqlite3.OperationalError("database is locked")
+
+    async def settle_cost(self, *args: Any, **kwargs: Any) -> None:
+        raise AssertionError("never reserved")
+
+    async def cost_since(self, since: datetime) -> Decimal:
+        return Decimal(0)
+
+
+async def test_unavailable_ledger_blocks_the_call() -> None:
+    guard = BudgetGuard(
+        BrokenLedger(), enabled=frozenset(PaidFeature), hard_limit_usd=Decimal(10), target_usd=0
+    )
+    wire = Wire()
+    x = XApiClient(wire.http("https://api.x.com"), guard=guard)
+
+    with pytest.raises(SourceUnavailable, match="ledger_unavailable"):
+        await x.lookup_post("20")
+    assert wire.requests == []

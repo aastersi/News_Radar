@@ -4,7 +4,7 @@ import asyncio
 import html
 import logging
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -79,10 +79,25 @@ class XApiClient:
 
         items: list[RawSourceItem] = []
         newest_id: str | None = None
-        for _ in range(max_pages):
-            body = await self._paid_get(
-                PaidFeature.X_SEARCH, "/2/tweets/search/recent", params, source_key, _PAGE_SIZE
-            )
+        for page in range(max_pages):
+            try:
+                body = await self._paid_get(
+                    PaidFeature.X_SEARCH, "/2/tweets/search/recent", params, source_key, _PAGE_SIZE
+                )
+            except BudgetBlocked as exc:
+                if page == 0:
+                    raise SourceUnavailable(exc.code) from exc
+                # Keep the pages already paid for; older posts are skipped as with max_pages.
+                logger.warning(
+                    "x pagination stopped by budget",
+                    extra={
+                        "operation": "x_collect",
+                        "result": "truncated",
+                        "source_key": source_key,
+                        "error_code": exc.code,
+                    },
+                )
+                break
             meta = _mapping(body.get("meta"))
             # Results are newest first, so the first page carries the overall newest id.
             newest_id = newest_id or meta.get("newest_id")
@@ -103,9 +118,12 @@ class XApiClient:
     async def lookup_post(self, post_id: str) -> RawSourceItem:
         if not _POST_ID.fullmatch(post_id):
             raise SourceUnavailable("invalid_post_id")
-        body = await self._paid_get(
-            PaidFeature.X_LOOKUP, f"/2/tweets/{post_id}", dict(_FIELDS), MANUAL_SOURCE_KEY, 1
-        )
+        try:
+            body = await self._paid_get(
+                PaidFeature.X_LOOKUP, f"/2/tweets/{post_id}", dict(_FIELDS), MANUAL_SOURCE_KEY, 1
+            )
+        except BudgetBlocked as exc:
+            raise SourceUnavailable(exc.code) from exc
         data = body.get("data")
         if not isinstance(data, dict):
             raise SourceUnavailable("not_found")
@@ -122,29 +140,38 @@ class XApiClient:
         source_key: str,
         max_posts: int,
     ) -> dict[str, Any]:
-        """Reserve the worst case before the request, then lower it to what was returned."""
-        try:
-            entry_id = await self._guard.reserve(
-                feature,
-                provider="x",
-                operation=feature.value,
-                units=max_posts * 2,
-                cost_usd=max_posts * (X_POST_READ_USD + X_USER_READ_USD),
+        """Reserve the worst case before every attempt; lower it only when the answer is known.
+
+        Raises BudgetBlocked when an attempt is not allowed.
+        """
+        reserved: list[int] = []
+
+        async def reserve() -> None:
+            reserved.append(
+                await self._guard.reserve(
+                    feature,
+                    provider="x",
+                    operation=feature.value,
+                    units=max_posts * 2,
+                    cost_usd=max_posts * (X_POST_READ_USD + X_USER_READ_USD),
+                )
             )
-        except BudgetBlocked as exc:
-            raise SourceUnavailable(exc.code) from exc
-        body: dict[str, Any] = {}
-        try:
-            body = await self._get(path, params, source_key)
-        finally:
-            data = body.get("data")
-            posts = len(data) if isinstance(data, list) else int(isinstance(data, dict))
-            users = min(len(_sequence(_mapping(body.get("includes")).get("users"))), max_posts)
-            await self._guard.settle(
-                entry_id,
-                units=posts + users,
-                cost_usd=posts * X_POST_READ_USD + users * X_USER_READ_USD,
-            )
+
+        async def answered(response: httpx.Response | None) -> None:
+            # X bills the resources it returns and an error status returns none. A lost
+            # response (None) may have been served, so its reservation stays.
+            if response is not None and response.status_code >= 400:
+                await self._guard.settle(reserved[-1], units=0, cost_usd=Decimal(0))
+
+        body = await self._get(path, params, source_key, reserve, answered)
+        data = body.get("data")
+        posts = len(data) if isinstance(data, list) else int(isinstance(data, dict))
+        users = min(len(_sequence(_mapping(body.get("includes")).get("users"))), max_posts)
+        await self._guard.settle(
+            reserved[-1],
+            units=posts + users,
+            cost_usd=posts * X_POST_READ_USD + users * X_USER_READ_USD,
+        )
         return body
 
     async def _get(
@@ -152,10 +179,18 @@ class XApiClient:
         path: str,
         params: Mapping[str, str | int],
         source_key: str,
+        before_attempt: Callable[[], Awaitable[None]],
+        after_attempt: Callable[[httpx.Response | None], Awaitable[None]],
     ) -> dict[str, Any]:
         try:
             response = await send_with_retry(
-                self._http, "GET", path, params=params, sleep=self._sleep
+                self._http,
+                "GET",
+                path,
+                params=params,
+                sleep=self._sleep,
+                before_attempt=before_attempt,
+                after_attempt=after_attempt,
             )
             body = response.json()
         except HttpFailure as exc:
