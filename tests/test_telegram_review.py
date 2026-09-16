@@ -9,6 +9,7 @@ from fakes import (
     Inbox,
     review_service,
     seed,
+    telegram,
     x_item,
 )
 
@@ -16,17 +17,8 @@ from qmemo_radar.application.review import DeliveryLimits, Outcome
 from qmemo_radar.domain import EventStatus
 from qmemo_radar.infrastructure.storage import SQLiteEventRepository
 from qmemo_radar.interfaces.telegram import render
-from qmemo_radar.interfaces.telegram.controller import TelegramController
 
 STRANGER_ID = 999
-
-
-def controller(repository: SQLiteEventRepository, gateway: FakeGateway) -> TelegramController:
-    return TelegramController(
-        allowed_user_id=OWNER_ID,
-        review=review_service(repository, gateway),
-        timezone=TIMEZONE,
-    )
 
 
 def count(repository: SQLiteEventRepository, table: str) -> int:
@@ -41,7 +33,7 @@ async def test_unauthorized_user_gets_no_state_and_changes_nothing(
     await seed(repository, x_item(1))
     await review_service(repository, gateway).deliver(urgent=False)
     [(card, _, _)] = gateway.cards
-    bot = controller(repository, gateway)
+    bot = telegram(repository, gateway)
     inbox = Inbox()
 
     for command in ("/status", "/today", "/saved", "/pause", "/run", "hello"):
@@ -111,7 +103,8 @@ async def test_event_is_notified_only_after_message_id_is_saved_and_failed_send_
     assert await service.deliver(urgent=False) == 1
     assert await repository.count_by_status() == {EventStatus.NOTIFIED.value: 1}
     with sqlite3.connect(repository._db_path) as db:
-        assert db.execute("SELECT message_id FROM telegram_deliveries").fetchall() == [(101,)]
+        rows = db.execute("SELECT message_id FROM telegram_deliveries").fetchall()
+    assert rows == [(gateway.cards[0][2],)]
 
 
 async def test_repeated_delivery_does_not_send_a_second_card(
@@ -161,7 +154,7 @@ async def test_old_buttons_do_not_change_a_finished_decision(
     await review_service(repository, gateway).deliver(urgent=False)
     [(card, _, _)] = gateway.cards
     event_id = card.event.event_id
-    bot = controller(repository, gateway)
+    bot = telegram(repository, gateway)
     inbox = Inbox()
 
     await bot.handle_callback(OWNER_ID, f"e:skip:{event_id}", inbox)
@@ -199,7 +192,7 @@ async def test_pause_stops_deliveries_and_why_explains_the_score(
     repository: SQLiteEventRepository,
 ) -> None:
     gateway = FakeGateway()
-    bot = controller(repository, gateway)
+    bot = telegram(repository, gateway)
     service = review_service(repository, gateway)
     await seed(repository, x_item(1))
     inbox = Inbox()

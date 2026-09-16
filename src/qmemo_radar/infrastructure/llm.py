@@ -1,6 +1,7 @@
 """Small OpenAI-compatible chat client. Prompts, outputs and keys are never logged."""
 
 import asyncio
+import json
 import logging
 from collections.abc import Callable
 
@@ -95,3 +96,8 @@ def _describe(exc: ValueError) -> str:
         ]
         return "; ".join(problems)[:1000]
     return str(exc)[:1000]
+
+
+def untrusted_json(value: object) -> str:
+    """JSON for a prompt data block. "<" is escaped so data can never close its block."""
+    return json.dumps(value, ensure_ascii=False).replace("<", "\\u003c")

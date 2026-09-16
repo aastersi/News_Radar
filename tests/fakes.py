@@ -1,19 +1,23 @@
 """Test doubles shared by the review, drafting and end-to-end tests."""
 
+import itertools
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from pydantic import HttpUrl
 
+from qmemo_radar.application.drafting import DraftService
 from qmemo_radar.application.filtering import FilterPolicy
 from qmemo_radar.application.pipeline import PipelineThresholds, RadarPipeline
+from qmemo_radar.application.ports import DraftWriter
 from qmemo_radar.application.review import DeliveryLimits, ReviewService
 from qmemo_radar.domain import Engagement, RawSourceItem, ScoredEvent, SourceType
 from qmemo_radar.exceptions import DeliveryFailed, SourceUnavailable
 from qmemo_radar.infrastructure.collectors import FakeCollector
+from qmemo_radar.infrastructure.drafting import DeterministicDraftWriter
 from qmemo_radar.infrastructure.ranking import DeterministicFixtureRanker
 from qmemo_radar.infrastructure.storage import SQLiteEventRepository
-from qmemo_radar.interfaces.telegram.controller import Reply
+from qmemo_radar.interfaces.telegram.controller import Reply, TelegramController
 
 OWNER_ID = 424242
 TIMEZONE = ZoneInfo("Asia/Ho_Chi_Minh")
@@ -22,17 +26,18 @@ TIMEZONE = ZoneInfo("Asia/Ho_Chi_Minh")
 class FakeGateway:
     """Stands in for Telegram. Records cards instead of sending them."""
 
+    _message_ids = itertools.count(101)  # unique per chat, like real Telegram message ids
+
     def __init__(self) -> None:
         self.cards: list[tuple[ScoredEvent, bool, int]] = []
         self.fail = False
-        self._next_message_id = 100
 
     async def send_card(self, card: ScoredEvent, *, urgent: bool) -> int:
         if self.fail:
             raise DeliveryFailed("TelegramNetworkError")
-        self._next_message_id += 1
-        self.cards.append((card, urgent, self._next_message_id))
-        return self._next_message_id
+        message_id = next(self._message_ids)
+        self.cards.append((card, urgent, message_id))
+        return message_id
 
 
 class FakeLookup:
@@ -106,4 +111,19 @@ def review_service(
         limits=limits or DeliveryLimits(),
         timezone=TIMEZONE,
         lookup=lookup,
+    )
+
+
+def telegram(
+    repository: SQLiteEventRepository,
+    gateway: FakeGateway,
+    *,
+    writer: DraftWriter | None = None,
+    lookup: FakeLookup | None = None,
+) -> TelegramController:
+    return TelegramController(
+        allowed_user_id=OWNER_ID,
+        review=review_service(repository, gateway, lookup=lookup),
+        drafts=DraftService(repository=repository, writer=writer or DeterministicDraftWriter()),
+        timezone=TIMEZONE,
     )

@@ -59,3 +59,10 @@ class RunStatus(StrEnum):
     SUCCESS = "SUCCESS"
     PARTIAL = "PARTIAL"
     FAILED = "FAILED"
+
+
+class DraftStatus(StrEnum):
+    ACTIVE = "ACTIVE"
+    SUPERSEDED = "SUPERSEDED"
+    ACCEPTED = "ACCEPTED"
+    REJECTED = "REJECTED"

@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -9,9 +10,12 @@ import aiosqlite
 
 from qmemo_radar.domain import (
     DeliveryKind,
+    Draft,
+    DraftStatus,
     Engagement,
     EventCandidate,
     EventStatus,
+    FactCheckStatus,
     FeedbackAction,
     ScoreBreakdown,
     ScoredEvent,
@@ -440,6 +444,142 @@ class SQLiteEventRepository:
             )
             await db.commit()
 
+    async def get_draft(self, draft_id: str) -> Draft | None:
+        async with self._connect() as db:
+            rows = list(await db.execute_fetchall("SELECT * FROM drafts WHERE id = ?", (draft_id,)))
+        return _draft_from_row(rows[0]) if rows else None
+
+    async def latest_draft(self, event_id: str) -> Draft | None:
+        async with self._connect() as db:
+            rows = list(
+                await db.execute_fetchall(
+                    "SELECT * FROM drafts WHERE event_id = ? ORDER BY version DESC LIMIT 1",
+                    (event_id,),
+                )
+            )
+        return _draft_from_row(rows[0]) if rows else None
+
+    async def latest_revisable_draft(self) -> Draft | None:
+        async with self._connect() as db:
+            rows = list(
+                await db.execute_fetchall(
+                    """
+                    SELECT d.* FROM drafts d JOIN radar_events e ON e.id = d.event_id
+                    WHERE d.status = ? AND d.version = 1 AND e.status = ?
+                    ORDER BY d.created_at DESC LIMIT 1
+                    """,
+                    (DraftStatus.ACTIVE.value, EventStatus.DRAFTED.value),
+                )
+            )
+        return _draft_from_row(rows[0]) if rows else None
+
+    async def save_first_draft(self, draft: Draft, *, telegram_user_id: int) -> bool:
+        now = datetime.now(UTC).isoformat()
+        try:
+            async with self._transaction() as db:
+                cursor = await db.execute(
+                    """
+                    UPDATE radar_events SET status = ?, updated_at = ?
+                    WHERE id = ? AND status IN (?, ?)
+                    """,
+                    (
+                        EventStatus.DRAFTED.value,
+                        now,
+                        draft.event_id,
+                        EventStatus.NOTIFIED.value,
+                        EventStatus.SNOOZED.value,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    await db.rollback()
+                    return False
+                await _insert_draft(db, draft)
+                await _insert_feedback(
+                    db, draft.event_id, draft.draft_id, FeedbackAction.USE, telegram_user_id, now
+                )
+        except sqlite3.IntegrityError:
+            return False
+        return True
+
+    async def save_revision(
+        self,
+        draft: Draft,
+        *,
+        previous_id: str,
+        action: FeedbackAction,
+        telegram_user_id: int,
+    ) -> bool:
+        now = datetime.now(UTC).isoformat()
+        try:
+            async with self._transaction() as db:
+                cursor = await db.execute(
+                    "UPDATE drafts SET status = ? WHERE id = ? AND status = ?",
+                    (DraftStatus.SUPERSEDED.value, previous_id, DraftStatus.ACTIVE.value),
+                )
+                if cursor.rowcount != 1:
+                    await db.rollback()
+                    return False
+                # UNIQUE(event_id, version) and CHECK(version <= 2) make a second revision
+                # impossible even if the application check were bypassed.
+                await _insert_draft(db, draft)
+                await _insert_feedback(
+                    db,
+                    draft.event_id,
+                    draft.draft_id,
+                    action,
+                    telegram_user_id,
+                    now,
+                    note=draft.revision_instruction,
+                )
+        except sqlite3.IntegrityError:
+            return False
+        return True
+
+    async def mark_verified(self, draft_id: str, *, telegram_user_id: int) -> bool:
+        now = datetime.now(UTC).isoformat()
+        async with self._transaction() as db:
+            cursor = await db.execute(
+                """
+                UPDATE drafts SET fact_check_status = ?
+                WHERE id = ? AND status = ? AND fact_check_status = ?
+                """,
+                (
+                    FactCheckStatus.VERIFIED.value,
+                    draft_id,
+                    DraftStatus.ACTIVE.value,
+                    FactCheckStatus.NEEDS_REVIEW.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                await db.rollback()
+                return False
+            rows = list(
+                await db.execute_fetchall("SELECT event_id FROM drafts WHERE id = ?", (draft_id,))
+            )
+            await _insert_feedback(
+                db, str(rows[0][0]), draft_id, FeedbackAction.VERIFY, telegram_user_id, now
+            )
+        return True
+
+    async def reject_draft(self, draft: Draft, *, telegram_user_id: int) -> bool:
+        now = datetime.now(UTC).isoformat()
+        async with self._transaction() as db:
+            drafts = await db.execute(
+                "UPDATE drafts SET status = ? WHERE id = ? AND status = ?",
+                (DraftStatus.REJECTED.value, draft.draft_id, DraftStatus.ACTIVE.value),
+            )
+            events = await db.execute(
+                "UPDATE radar_events SET status = ?, updated_at = ? WHERE id = ? AND status = ?",
+                (EventStatus.SKIPPED.value, now, draft.event_id, EventStatus.DRAFTED.value),
+            )
+            if drafts.rowcount != 1 or events.rowcount != 1:
+                await db.rollback()
+                return False
+            await _insert_feedback(
+                db, draft.event_id, draft.draft_id, FeedbackAction.REJECT, telegram_user_id, now
+            )
+        return True
+
     @classmethod
     def _scored_from_row(cls, row: aiosqlite.Row) -> ScoredEvent:
         values = dict(row)
@@ -532,4 +672,49 @@ async def _insert_feedback(
         VALUES (?, ?, ?, ?, ?, ?)
         """,
         (event_id, draft_id, action.value, note, telegram_user_id, now),
+    )
+
+
+async def _insert_draft(db: aiosqlite.Connection, draft: Draft) -> None:
+    await db.execute(
+        """
+        INSERT INTO drafts (
+            id, event_id, version, quote_text, quote_author, quote_language,
+            context_summary, qmemo_text, x_text_template, x_text_short, angle, cta,
+            fact_check_status, fact_check_notes_json, prompt_version, model_name,
+            revision_instruction, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            draft.draft_id,
+            draft.event_id,
+            draft.version,
+            draft.quote_text,
+            draft.quote_author,
+            draft.quote_language,
+            draft.context_summary,
+            draft.qmemo_text,
+            draft.x_text_template,
+            draft.x_text_short,
+            draft.angle,
+            draft.cta,
+            draft.fact_check_status.value,
+            json.dumps(list(draft.fact_check_notes), ensure_ascii=False),
+            draft.prompt_version,
+            draft.model_name,
+            draft.revision_instruction,
+            draft.status.value,
+            draft.created_at.isoformat(),
+        ),
+    )
+
+
+def _draft_from_row(row: aiosqlite.Row) -> Draft:
+    values = dict(row)
+    return Draft.model_validate(
+        {
+            **{key: values[key] for key in Draft.model_fields if key in values},
+            "draft_id": values["id"],
+            "fact_check_notes": tuple(json.loads(values["fact_check_notes_json"])),
+        }
     )

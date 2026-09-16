@@ -4,8 +4,15 @@ import html
 from collections.abc import Sequence
 from zoneinfo import ZoneInfo
 
+from qmemo_radar.application.drafting import MAX_DRAFT_VERSIONS
 from qmemo_radar.application.review import TodayReport
-from qmemo_radar.domain import EventStatus, ScoredEvent, ScoreResult
+from qmemo_radar.domain import (
+    Draft,
+    EventStatus,
+    FactCheckStatus,
+    ScoredEvent,
+    ScoreResult,
+)
 
 Button = tuple[str, str]
 Keyboard = tuple[tuple[Button, ...], ...]
@@ -18,7 +25,9 @@ HELP_TEXT = (
     "/pause — остановить автоматический сбор и отправку\n"
     "/resume — продолжить\n\n"
     "Можно прислать ссылку вида https://x.com/имя/status/123 — она будет оценена "
-    "при следующем сборе."
+    "при следующем сборе.\n"
+    "Пока открыт первый черновик, обычное сообщение считается инструкцией "
+    "для единственной переделки."
 )
 
 _FORMATS = {
@@ -73,6 +82,50 @@ def card_keyboard(event_id: str) -> Keyboard:
             ("❓ Почему такой балл?", callback_data("e", "why", event_id)),
         ),
     )
+
+
+def draft_keyboard(draft: Draft) -> Keyboard:
+    first: tuple[Button, ...] = (("✅ Принято", callback_data("d", "ok", draft.draft_id)),)
+    if draft.fact_check_status is FactCheckStatus.NEEDS_REVIEW:
+        first += (("🔎 Проверено вручную", callback_data("d", "ver", draft.draft_id)),)
+    rows: list[tuple[Button, ...]] = [first]
+    if draft.version < MAX_DRAFT_VERSIONS:
+        rows.append(
+            (
+                ("✂️ Переделать короче", callback_data("d", "short", draft.draft_id)),
+                ("🔄 Другой угол", callback_data("d", "angle", draft.draft_id)),
+            )
+        )
+    rows.append((("❌ Отказаться", callback_data("d", "rej", draft.draft_id)),))
+    return tuple(rows)
+
+
+def draft_text(draft: Draft, card: ScoredEvent) -> str:
+    event, score = card.event, card.score
+    verified = draft.fact_check_status is FactCheckStatus.VERIFIED
+    lines = [
+        f"📝 <b>Черновик v{draft.version}</b> · {esc(score.headline)}",
+        "",
+        f"<b>Цитата</b> ({esc(draft.quote_language)}):",
+        f"<blockquote>{esc(draft.quote_text)}</blockquote>",
+        f"— {esc(draft.quote_author)}",
+        f"🔗 {link(str(event.url), 'Источник')} · ID {esc(event.external_id)}",
+        "",
+        f"<b>Контекст:</b> {esc(draft.context_summary)}",
+        f"<b>Текст для QMemo:</b>\n{esc(draft.qmemo_text)}",
+        f"<b>X — основной:</b>\n{esc(draft.x_text_template)}",
+        f"<b>X — короткий:</b>\n{esc(draft.x_text_short)}",
+        f"<b>Угол:</b> {esc(draft.angle)}",
+        f"<b>Формат:</b> {esc(_label(_FORMATS, score.recommended_format))}",
+        f"<b>Призыв:</b> {esc(draft.cta)}",
+        "<b>Проверка фактов:</b> " + ("✅ проверено" if verified else "⚠️ требуется проверка"),
+    ]
+    lines += [f"• {esc(note)}" for note in draft.fact_check_notes]
+    lines += [
+        f"Переделок осталось: {MAX_DRAFT_VERSIONS - draft.version}",
+        "<i>{qmemo_url} будет заменён реальной ссылкой QMemo. Публикация выключена.</i>",
+    ]
+    return "\n".join(lines)
 
 
 def card_text(card: ScoredEvent, *, timezone: ZoneInfo, urgent: bool) -> str:

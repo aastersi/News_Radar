@@ -4,6 +4,8 @@ from typing import Protocol
 
 from qmemo_radar.domain import (
     DeliveryKind,
+    Draft,
+    DraftText,
     EventCandidate,
     EventStatus,
     FeedbackAction,
@@ -133,3 +135,42 @@ class QuotePublisher(Protocol):
 
 class XPublisher(Protocol):
     async def publish(self, package: PublicationPackage, qmemo_url: str) -> str: ...
+
+
+class DraftWriter(Protocol):
+    async def write(
+        self,
+        card: ScoredEvent,
+        *,
+        previous: Draft | None = None,
+        instruction: str | None = None,
+    ) -> DraftText:
+        """Write a draft, or a revision of `previous`; raise DraftFailed when impossible."""
+        ...
+
+
+class DraftRepository(ReviewRepository, Protocol):
+    async def get_draft(self, draft_id: str) -> Draft | None: ...
+
+    async def latest_draft(self, event_id: str) -> Draft | None: ...
+
+    async def latest_revisable_draft(self) -> Draft | None: ...
+
+    async def save_first_draft(self, draft: Draft, *, telegram_user_id: int) -> bool:
+        """Insert version 1 and move the event to DRAFTED atomically."""
+        ...
+
+    async def save_revision(
+        self,
+        draft: Draft,
+        *,
+        previous_id: str,
+        action: FeedbackAction,
+        telegram_user_id: int,
+    ) -> bool:
+        """Insert version 2 and supersede the previous version atomically."""
+        ...
+
+    async def mark_verified(self, draft_id: str, *, telegram_user_id: int) -> bool: ...
+
+    async def reject_draft(self, draft: Draft, *, telegram_user_id: int) -> bool: ...

@@ -32,3 +32,11 @@ class DeliveryFailed(RadarError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+class DraftFailed(RadarError):
+    """A draft could not be produced with valid, source-bound content."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code

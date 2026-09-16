@@ -6,6 +6,12 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
 
+from qmemo_radar.application.drafting import (
+    DraftOutcome,
+    DraftResult,
+    DraftService,
+    RevisionMode,
+)
 from qmemo_radar.application.normalization import parse_x_status_url
 from qmemo_radar.application.review import Outcome, ReviewService
 from qmemo_radar.interfaces.telegram import render
@@ -16,6 +22,18 @@ logger = logging.getLogger(__name__)
 _ITEM_ID = re.compile(r"[0-9a-f]{32}")
 _DECIDED = "Решение по этому событию уже принято, кнопка больше не действует."
 _NOT_FOUND = "Событие не найдено."
+_STALE_BUTTON = "Кнопка устарела."
+_DRAFT_MESSAGES = {
+    DraftOutcome.IN_PROGRESS: "Черновик уже готовится, подождите.",
+    DraftOutcome.NOT_FOUND: "Черновик или событие не найдены.",
+    DraftOutcome.CLOSED: "Событие уже закрыто, черновик не нужен.",
+    DraftOutcome.STALE: "Эта версия черновика устарела или решение уже принято.",
+    DraftOutcome.LIMIT_REACHED: "Переделка уже использована: доступна только одна.",
+    DraftOutcome.FAILED: (
+        "Не удалось подготовить черновик с точной цитатой из источника. Попробуйте ещё раз позже."
+    ),
+}
+_REVISIONS = {"short": RevisionMode.SHORTER, "angle": RevisionMode.ANGLE}
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,10 +51,12 @@ class TelegramController:
         *,
         allowed_user_id: int,
         review: ReviewService,
+        drafts: DraftService,
         timezone: ZoneInfo,
     ) -> None:
         self._allowed_user_id = allowed_user_id
         self._review = review
+        self._drafts = drafts
         self._timezone = timezone
 
     async def handle_message(self, user_id: int | None, text: str, send: Send) -> None:
@@ -57,15 +77,17 @@ class TelegramController:
             await send(Reply(f"Radar {state}."))
         elif parse_x_status_url(text):
             await send(Reply(_link_reply(await self._review.submit_link(text))))
-        else:
+        elif command.startswith("/") or not command:
             await send(Reply(render.HELP_TEXT))
+        else:
+            await self._revise_by_instruction(text.strip(), send)
 
     async def handle_callback(self, user_id: int | None, data: str, send: Send) -> None:
         if not await self._authorized(user_id, send):
             return
         parts = data.split(":")
         if len(parts) != 3 or not _ITEM_ID.fullmatch(parts[2]):
-            await send(Reply("Кнопка устарела."))
+            await send(Reply(_STALE_BUTTON))
             return
         scope, action, item_id = parts
         if scope == "e" and action == "why":
@@ -77,8 +99,43 @@ class TelegramController:
         elif scope == "e" and action == "later":
             outcome = await self._review.later(item_id, self._allowed_user_id)
             await send(Reply(_decision_reply(outcome, "🕒 Отложено до следующей подборки.")))
+        elif scope == "e" and action == "use":
+            await send(Reply("⏳ Готовлю черновик…"))
+            await self._send_draft(await self._drafts.use(item_id, self._allowed_user_id), send)
+        elif scope == "d" and action in _REVISIONS:
+            await send(Reply("⏳ Переделываю…"))
+            result = await self._drafts.revise(item_id, self._allowed_user_id, _REVISIONS[action])
+            await self._send_draft(result, send)
+        elif scope == "d" and action == "ver":
+            await self._send_draft(await self._drafts.verify(item_id, self._allowed_user_id), send)
+        elif scope == "d" and action == "rej":
+            result = await self._drafts.reject(item_id, self._allowed_user_id)
+            if result.outcome is DraftOutcome.CREATED:
+                await send(Reply("❌ Черновик отклонён, событие пропущено."))
+            else:
+                await send(Reply(_DRAFT_MESSAGES.get(result.outcome, _STALE_BUTTON)))
         else:
-            await send(Reply("Кнопка устарела."))
+            await send(Reply(_STALE_BUTTON))
+
+    async def _revise_by_instruction(self, text: str, send: Send) -> None:
+        draft = await self._drafts.revisable_draft()
+        if draft is None:
+            await send(Reply(render.HELP_TEXT))
+            return
+        await send(Reply("⏳ Переделываю по вашей инструкции…"))
+        result = await self._drafts.revise(
+            draft.draft_id, self._allowed_user_id, RevisionMode.CUSTOM, text[:500]
+        )
+        await self._send_draft(result, send)
+
+    async def _send_draft(self, result: DraftResult, send: Send) -> None:
+        draft = result.draft
+        if result.outcome in (DraftOutcome.CREATED, DraftOutcome.EXISTS) and draft is not None:
+            card = await self._review.explain(draft.event_id)
+            if card is not None:
+                await send(Reply(render.draft_text(draft, card), render.draft_keyboard(draft)))
+                return
+        await send(Reply(_DRAFT_MESSAGES.get(result.outcome, _STALE_BUTTON)))
 
     async def _authorized(self, user_id: int | None, send: Send) -> bool:
         if user_id is not None and user_id == self._allowed_user_id:
