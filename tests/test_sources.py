@@ -340,3 +340,101 @@ async def test_upgrade_to_shared_quote_urls_keeps_rows_and_children(tmp_path: Pa
     assert {"idx_events_source_url", "idx_events_content_hash", "idx_events_duplicate_of"} <= set(
         indexes
     )
+
+
+async def test_gdelt_and_rss_run_together_free_while_paid_x_is_blocked(
+    repository: SQLiteEventRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import gzip
+    import json
+
+    from qmemo_radar.application.budget import month_start
+    from qmemo_radar.infrastructure.collectors import rss as rss_module
+
+    async def public(host: str, port: int) -> list[str]:
+        return ["93.184.216.34"]
+
+    monkeypatch.setattr(rss_module, "_resolve", public)
+    now = datetime.now(UTC)
+    quote = {
+        "date": now.isoformat(),
+        "url": "https://news.example/gdelt",
+        "title": "Budget",
+        "lang": "ENGLISH",
+        "quotes": [{"pre": "", "quote": "The budget is final and it will not change", "post": ""}],
+    }
+    feed = (
+        "<rss><channel><item><title>A fresh headline for the radar today</title>"
+        f"<link>https://news.example/rss</link><pubDate>{now:%a, %d %b %Y %H:%M:%S} +0000"
+        "</pubDate></item></channel></rss>"
+    ).encode()
+    requests: list[str] = []
+
+    def web(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.host)
+        if request.url.host == "data.gdeltproject.org":
+            return httpx.Response(200, content=gzip.compress(json.dumps(quote).encode()))
+        if request.url.host == "wire.example":
+            return httpx.Response(200, content=feed)
+        return httpx.Response(599)  # X must never be reached
+
+    # The month's paid budget is already used up.
+    spent = CostEntry(
+        provider="x", operation="earlier", units=1, estimated_cost_usd=Decimal(10), created_at=now
+    )
+    assert await repository.reserve_cost(spent, since=month_start(now), limit_usd=Decimal(10))
+    guard = BudgetGuard(
+        repository,
+        enabled=frozenset(PaidFeature),
+        hard_limit_usd=Decimal(10),
+        target_usd=Decimal(0),
+    )
+    transport = httpx.MockTransport(web)
+    sources = X_SOURCES.model_copy(
+        update={
+            "rss": SourcesConfig.model_validate(
+                {"rss": {"feeds": [{"name": "wire", "url": "https://wire.example/rss"}]}}
+            ).rss
+        }
+    )
+    config = settings(**X_ON, gdelt_enabled=True, gdelt_max_minutes_per_run=1)
+    context = SourceContext(
+        config,
+        sources,
+        XApiClient(httpx.AsyncClient(transport=transport), guard=guard),
+        free_http=httpx.AsyncClient(transport=transport),
+    )
+    collector = build_collector(context)
+    assert collector.names == ["x_search", "gdelt_gqg", "rss"]
+
+    counters = await pipeline(collector, repository).run_once()
+
+    assert counters.inserted == 2  # the GDELT quote and the RSS entry
+    assert counters.source_errors == 2  # the two X queries, blocked before any request
+    assert "api.x.com" not in requests
+    assert await repository.cost_since(month_start(now)) == Decimal(10)  # nothing added
+    with sqlite3.connect(repository._db_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM cost_ledger").fetchone() == (1,)
+
+
+async def test_free_sources_alone_never_touch_the_cost_ledger(
+    repository: SQLiteEventRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from qmemo_radar.application.budget import month_start
+    from qmemo_radar.infrastructure.collectors import rss as rss_module
+
+    async def public(host: str, port: int) -> list[str]:
+        return ["93.184.216.34"]
+
+    monkeypatch.setattr(rss_module, "_resolve", public)
+    sources = SourcesConfig.model_validate(
+        {"rss": {"feeds": [{"name": "wire", "url": "https://wire.example/rss"}]}}
+    )
+    config = settings(gdelt_enabled=True, gdelt_max_minutes_per_run=3)
+    http = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(404)))
+    collector = build_collector(SourceContext(config, sources, x_client=None, free_http=http))
+
+    await pipeline(collector, repository).run_once()
+
+    assert collector.names == ["gdelt_gqg", "rss"]
+    assert await repository.cost_since(month_start(datetime.now(UTC))) == Decimal(0)
