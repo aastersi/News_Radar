@@ -2,7 +2,10 @@ import asyncio
 import json
 import logging
 import re
+import signal
 import socket
+import subprocess
+import sys
 from collections.abc import Mapping
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
@@ -368,3 +371,40 @@ async def test_manual_link_skips_age_limit_and_reaches_the_owner(
     assert inbox.replies[0].text == "Ссылка добавлена. Она будет оценена при следующем сборе."
     assert [card.event.source_key for card, _, _ in gateway.cards] == ["manual"]
     assert await repository.count_by_status() == {EventStatus.NOTIFIED.value: 1}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals; runs in CI and Docker")
+def test_sigterm_stops_the_process_gracefully(tmp_path: Path) -> None:
+    script = tmp_path / "radar_process.py"
+    script.write_text(
+        """
+import asyncio
+from qmemo_radar.interfaces.runtime import install_signal_handlers, serve
+
+async def job(name):
+    try:
+        print("started", name, flush=True)
+        await asyncio.Event().wait()
+    finally:
+        print("closed", name, flush=True)
+
+async def main():
+    stop = asyncio.Event()
+    install_signal_handlers(stop)
+    await serve([lambda: job("scheduler"), lambda: job("poller")], stop)
+    print("shutdown complete", flush=True)
+
+asyncio.run(main())
+""",
+        encoding="utf-8",
+    )
+    process = subprocess.Popen([sys.executable, str(script)], stdout=subprocess.PIPE, text=True)
+    assert process.stdout is not None
+    started = {process.stdout.readline().strip(), process.stdout.readline().strip()}
+    process.send_signal(signal.SIGTERM)
+    output, _ = process.communicate(timeout=10)
+
+    assert started == {"started scheduler", "started poller"}
+    assert process.returncode == 0
+    assert "closed scheduler" in output and "closed poller" in output
+    assert output.strip().endswith("shutdown complete")
