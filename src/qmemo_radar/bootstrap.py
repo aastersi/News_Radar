@@ -31,6 +31,7 @@ from qmemo_radar.application.runner import RadarRunner
 from qmemo_radar.application.scheduler import RadarScheduler
 from qmemo_radar.config import RadarSettings, SourcesConfig
 from qmemo_radar.exceptions import ProductionAdapterNotConfigured
+from qmemo_radar.infrastructure.collectors.gdelt_gqg import GdeltQuotationCollector
 from qmemo_radar.infrastructure.collectors.x_api import (
     X_API_BASE_URL,
     XApiClient,
@@ -173,6 +174,8 @@ class SourceContext:
     settings: RadarSettings
     sources: SourcesConfig
     x_client: XApiClient | None
+    # Shared client of the free sources (GDELT, RSS): never authenticated, never redirected.
+    free_http: httpx.AsyncClient | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,10 +198,28 @@ def _build_x_search(context: SourceContext) -> SourceCollector:
     return build_x_collector(context.x_client, context.settings, context.sources)
 
 
+def _free_http(context: SourceContext) -> httpx.AsyncClient:
+    if context.free_http is None:
+        raise ValueError("free sources need the shared HTTP client")
+    return context.free_http
+
+
+def _build_gdelt(context: SourceContext) -> SourceCollector:
+    settings = context.settings
+    return GdeltQuotationCollector(
+        _free_http(context),
+        safety_lag=timedelta(minutes=settings.gdelt_safety_lag_minutes),
+        max_minutes_per_run=settings.gdelt_max_minutes_per_run,
+        first_run_lookback=timedelta(minutes=settings.max_event_age_minutes),
+        languages=settings.gdelt_language_set,
+        allow_unknown_language=settings.gdelt_allow_unknown_language,
+    )
+
+
 # One entry per source type. A disabled entry is never built, so it needs no credentials.
-# M3 adds `gdelt_gqg` and `rss` here.
 SOURCE_REGISTRY: tuple[SourceRegistration, ...] = (
     SourceRegistration("x_search", _x_search_enabled, _build_x_search),
+    SourceRegistration("gdelt_gqg", lambda settings, _: settings.gdelt_enabled, _build_gdelt),
 )
 
 
@@ -252,8 +273,9 @@ async def build_runtime(settings: RadarSettings, sources: SourcesConfig) -> Asyn
             llm = build_llm_client(settings, llm_http, guard)
         bot = build_bot(settings.telegram_bot_token.get_secret_value())
         stack.push_async_callback(bot.session.close)
+        free_http = await stack.enter_async_context(build_free_http_client())
 
-        collector = build_collector(SourceContext(settings, sources, x_client))
+        collector = build_collector(SourceContext(settings, sources, x_client, free_http))
         # An upgrade from the X pilot without the new paid flags would otherwise run silently idle.
         logger.log(
             logging.INFO if collector.names and llm else logging.WARNING,
@@ -298,6 +320,16 @@ async def build_runtime(settings: RadarSettings, sources: SourcesConfig) -> Asyn
             quote_publisher=quote_publisher,
             x_publisher=x_publisher,
         )
+
+
+def build_free_http_client() -> httpx.AsyncClient:
+    """For keyless public sources. Redirects are followed by the collector, one checked hop at
+    a time, so a feed cannot bounce the request to an internal address."""
+    return httpx.AsyncClient(
+        headers={"User-Agent": "qmemo-news-radar/0.1"},
+        timeout=httpx.Timeout(30.0, connect=10.0),
+        follow_redirects=False,
+    )
 
 
 def build_x_http_client(settings: RadarSettings) -> httpx.AsyncClient:
