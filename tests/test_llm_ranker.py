@@ -147,7 +147,8 @@ async def test_fixture_priorities_filters_and_batches(repository: SQLiteEventRep
 
     assert 20 <= len(FIXTURES) <= 30
     assert [len(posts_in(payload)) for payload in model.payloads] == [10, 10, 3]
-    assert (counters.filtered, counters.scored, counters.rank_failed) == (3, 23, 0)
+    assert (counters.filtered, counters.duplicates) == (2, 1)  # identical text is a duplicate
+    assert (counters.scored, counters.rank_failed) == (23, 0)
     reasons = dict(rows(repository, "SELECT external_id, filter_reason FROM radar_events"))
     assert reasons["old-1"] == "too_old"
     assert reasons["duplicate-1"] == "duplicate_content"

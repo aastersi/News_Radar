@@ -1,6 +1,9 @@
 import logging
+from collections import Counter, defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from uuid import uuid4
 
 from qmemo_radar.application.filtering import (
     MANUAL_SOURCE_KEY,
@@ -10,10 +13,21 @@ from qmemo_radar.application.filtering import (
 from qmemo_radar.application.normalization import build_candidate
 from qmemo_radar.application.ports import EventRepository, Ranker, SourceCollector
 from qmemo_radar.application.scoring import calculate_total
-from qmemo_radar.domain import EventCandidate, EventStatus, PipelineCounters, ScoreResult
+from qmemo_radar.domain import (
+    EventCandidate,
+    EventStatus,
+    Metric,
+    PipelineCounters,
+    RawSourceItem,
+    ScoreResult,
+)
 from qmemo_radar.exceptions import RankingFailed
 
 logger = logging.getLogger(__name__)
+
+DUPLICATE_CONTENT = "duplicate_content"
+# One SQLite transaction per chunk: few commits, and the write lock is never held for long.
+INGEST_CHUNK_SIZE = 500
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,12 +56,14 @@ class RadarPipeline:
         self._thresholds = thresholds
 
     async def run_once(self, *, run_id: str | None = None) -> PipelineCounters:
-        counters = PipelineCounters()
+        run_id = run_id or uuid4().hex
+        metrics: defaultdict[str, Counter[Metric]] = defaultdict(Counter)
         checkpoints = await self._repository.get_checkpoints()
         for fetch in await self._collector.collect(checkpoints):
             log = {"run_id": run_id, "operation": "collect", "source_key": fetch.source_key}
+            stats = metrics[fetch.source_key]
             if fetch.error_code:
-                counters.source_errors += 1
+                stats[Metric.SOURCE_ERRORS] += 1
                 await self._repository.record_source_result(
                     fetch.source_key, cursor=None, error_code=fetch.error_code
                 )
@@ -57,18 +73,14 @@ class RadarPipeline:
                 )
                 continue
 
-            counters.collected += len(fetch.items)
-            for raw_item in fetch.items:
-                inserted = await self._repository.add_event(build_candidate(raw_item))
-                if not inserted:
-                    counters.duplicates += 1
-                    continue
-                counters.inserted += 1
+            stats[Metric.COLLECTED] += len(fetch.items)
+            for chunk in _batches(fetch.items, size=INGEST_CHUNK_SIZE):
+                await self._ingest(chunk, stats)
             # A storage error above aborts the run: the cursor moves only after every item is saved.
             await self._repository.record_source_result(
                 fetch.source_key, cursor=fetch.cursor, error_code=None
             )
-            logger.info("source collected", extra={**log, "result": f"items={len(fetch.items)}"})
+            logger.info("source collected", extra={**log, "result": _describe(stats)})
 
         pending = await self._repository.list_events_by_status(
             EventStatus.DISCOVERED,
@@ -76,9 +88,11 @@ class RadarPipeline:
         )
         candidates: list[EventCandidate] = []
         for event in pending:
+            # New items were screened on ingest; this re-check covers manual links, items left
+            # from older versions and candidates that became too old while waiting.
             reason = first_filter_reason(event, self._filter_policy)
             if reason is None and await self._repository.has_earlier_content_duplicate(event):
-                reason = "duplicate_content"
+                reason = DUPLICATE_CONTENT
             if reason:
                 await self._repository.set_status(
                     event.event_id,
@@ -95,9 +109,18 @@ class RadarPipeline:
                         "result": reason,
                     },
                 )
-                counters.filtered += 1
+                metrics[event.source_key or event.source.value][_metric_for(reason)] += 1
                 continue
             candidates.append(event)
+
+        await self._repository.record_metrics(run_id, metrics)
+        counters = PipelineCounters()
+        for stats in metrics.values():
+            counters.collected += stats[Metric.COLLECTED]
+            counters.inserted += stats[Metric.INSERTED]
+            counters.duplicates += stats[Metric.EXACT_DUPLICATES]
+            counters.filtered += stats[Metric.FILTERED]
+            counters.source_errors += stats[Metric.SOURCE_ERRORS]
 
         if self._ranker is None:
             # No free ranker exists yet and paid LLM is off: candidates wait (or expire) unranked.
@@ -173,14 +196,64 @@ class RadarPipeline:
                 counters.archived += 1
         return True
 
+    async def _ingest(self, items: Sequence[RawSourceItem], stats: Counter[Metric]) -> None:
+        """Stage 1 for one chunk: normalize, screen, drop exact duplicates, insert in one commit.
+
+        Future stages (near dedup, clustering, preselection) read DISCOVERED events after this
+        and before ranking; they must not be added here.
+        """
+        now = datetime.now(UTC)
+        events = [build_candidate(item, discovered_at=now) for item in items]
+        known = await self._repository.find_known(events)
+        ids, urls = set(known.ids), set(known.urls)
+        owners = dict(known.content_owners)
+        rows: list[EventCandidate] = []
+        for event in events:
+            id_key = (event.source.value, event.external_id)
+            url_key = (event.source.value, str(event.url))
+            if id_key in ids or url_key in urls:
+                stats[Metric.EXACT_DUPLICATES] += 1
+                continue
+            ids.add(id_key)
+            urls.add(url_key)
+            reason = first_filter_reason(event, self._filter_policy, now=now)
+            original = None if reason else owners.get(event.content_hash)
+            if original:
+                reason = DUPLICATE_CONTENT
+            else:
+                owners.setdefault(event.content_hash, event.event_id)
+            if reason:
+                # Kept, not dropped: retention prunes noise later and copies count as signal.
+                event = event.model_copy(
+                    update={
+                        "status": EventStatus.FILTERED_OUT,
+                        "filter_reason": reason,
+                        "duplicate_of_event_id": original,
+                    }
+                )
+                stats[_metric_for(reason)] += 1
+            rows.append(event)
+        inserted = await self._repository.add_events(rows)
+        stats[Metric.INSERTED] += inserted
+        # Only a concurrent writer (a manual link) can make this non-zero.
+        stats[Metric.EXACT_DUPLICATES] += len(rows) - inserted
+
     def _status_for_score(self, total: int) -> EventStatus:
         if total >= self._thresholds.digest:
             return EventStatus.SHORTLISTED
         return EventStatus.ARCHIVED
 
 
-def _batches(events: Sequence[EventCandidate], *, size: int) -> list[list[EventCandidate]]:
-    return [list(events[index : index + size]) for index in range(0, len(events), size)]
+def _batches[T](items: Sequence[T], *, size: int) -> list[list[T]]:
+    return [list(items[index : index + size]) for index in range(0, len(items), size)]
+
+
+def _metric_for(reason: str) -> Metric:
+    return Metric.EXACT_DUPLICATES if reason == DUPLICATE_CONTENT else Metric.FILTERED
+
+
+def _describe(stats: Counter[Metric]) -> str:
+    return " ".join(f"{metric.value}={value}" for metric, value in stats.items() if value)
 
 
 def _validate_results(

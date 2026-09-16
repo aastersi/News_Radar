@@ -1,5 +1,6 @@
 """Source registry: independent collectors, isolated failures, own checkpoints, no duplicates."""
 
+import sqlite3
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -156,3 +157,70 @@ async def test_free_collector_keeps_working_when_the_budget_is_exhausted(
         "query:q": "hard_limit_reached",
         "rss:wire": None,
     }
+
+
+async def test_ingestion_metrics_per_source(
+    repository: SQLiteEventRepository, caplog: pytest.LogCaptureFixture
+) -> None:
+    def rss(number: int, text: str, *, minutes_ago: int = 5) -> RawSourceItem:
+        return article(SourceType.RSS, number).model_copy(
+            update={
+                "original_text": text,
+                "published_at": datetime.now(UTC) - timedelta(minutes=minutes_ago),
+            }
+        )
+
+    shared = 'The minister said: "The wire story is identical everywhere today."'
+    feed = Feed(
+        "rss:wire",
+        [
+            rss(1, shared),
+            rss(2, 'The minister said: "An old statement from yesterday."', minutes_ago=600),
+            rss(3, "Too short"),
+            rss(4, shared),  # same text, different article
+            rss(5, 'The minister said: "A second fresh statement for the radar."'),
+            rss(5, 'The minister said: "A second fresh statement for the radar."'),  # repeated id
+        ],
+    )
+    gdelt = Feed(
+        "gdelt:gqg",
+        [
+            article(SourceType.GDELT, 1).model_copy(update={"original_text": shared}),
+            article(SourceType.GDELT, 2),
+        ],
+    )
+    collector = MultiSourceCollector({"rss": feed, "gdelt": gdelt, "broken": Crashing()})
+
+    first = await pipeline(collector, repository).run_once(run_id="run-1")
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        second = await pipeline(collector, repository).run_once(run_id="run-2")
+
+    assert (first.collected, first.inserted, first.duplicates, first.filtered) == (8, 7, 3, 2)
+    assert (first.source_errors, first.scored) == (1, 3)
+    assert (second.collected, second.inserted, second.duplicates, second.filtered) == (8, 0, 8, 0)
+    assert await repository.metrics_since(datetime(2000, 1, 1, tzinfo=UTC)) == {
+        "broken": {"source_errors": 2},
+        "gdelt:gqg": {"collected": 4, "exact_duplicates": 3, "inserted": 2},
+        "rss:wire": {"collected": 12, "exact_duplicates": 8, "filtered": 2, "inserted": 5},
+    }
+    with sqlite3.connect(repository._db_path) as db:
+        rows = db.execute(
+            "SELECT external_id, status, filter_reason, duplicate_of_event_id IS NOT NULL "
+            "FROM radar_events ORDER BY rowid"
+        ).fetchall()
+    assert rows == [
+        ("rss-1", "SHORTLISTED", None, 0),
+        ("rss-2", "FILTERED_OUT", "too_old", 0),
+        ("rss-3", "FILTERED_OUT", "too_short", 0),
+        ("rss-4", "FILTERED_OUT", "duplicate_content", 1),
+        ("rss-5", "SHORTLISTED", None, 0),
+        ("gdelt-1", "FILTERED_OUT", "duplicate_content", 1),
+        ("gdelt-2", "SHORTLISTED", None, 0),
+    ]
+    logged = {
+        getattr(record, "source_key", None): getattr(record, "result", None)
+        for record in caplog.records
+        if record.getMessage() == "source collected"
+    }
+    assert logged["rss:wire"] == "collected=6 exact_duplicates=6"

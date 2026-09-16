@@ -1,4 +1,4 @@
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -318,7 +318,7 @@ async def test_repeated_run_uses_checkpoint_and_creates_no_duplicates(
 
 
 class FailingRepository(SQLiteEventRepository):
-    async def add_event(self, event: EventCandidate) -> bool:
+    async def add_events(self, events: Sequence[EventCandidate]) -> int:
         raise RuntimeError("database is locked")
 
 

@@ -72,6 +72,8 @@ class EventCandidate(RawSourceItem):
     normalized_text: str
     content_hash: str
     status: EventStatus = EventStatus.DISCOVERED
+    filter_reason: str | None = None
+    duplicate_of_event_id: str | None = None
 
 
 class ScoreBreakdown(DomainModel):

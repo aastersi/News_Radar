@@ -8,6 +8,7 @@ from pathlib import Path
 
 from pydantic import HttpUrl
 
+from qmemo_radar.application.budget import month_start
 from qmemo_radar.application.runner import HEARTBEAT_KEY
 from qmemo_radar.bootstrap import build_application, build_services, enabled_sources
 from qmemo_radar.config import RadarSettings, SourcesConfig, load_sources
@@ -62,6 +63,7 @@ async def execute(command: str, *, db_path: Path | None = None) -> int:
     if command == "status":
         await app.repository.initialize()
         counts = await app.repository.count_by_status()
+        now = datetime.now(UTC)
         print(
             json.dumps(
                 {
@@ -69,6 +71,9 @@ async def execute(command: str, *, db_path: Path | None = None) -> int:
                     "database": str(settings.db_path),
                     "events": counts,
                     "outbox_approved": await app.repository.count_packages(OutboxStatus.APPROVED),
+                    "ingestion_24h": await app.repository.metrics_since(now - timedelta(days=1)),
+                    "cost_month_usd": str(await app.repository.cost_since(month_start(now))),
+                    "cost_hard_limit_usd_monthly": str(settings.cost_hard_limit_usd_monthly),
                     "qmemo_publishing": settings.qmemo_publishing_enabled,
                     "x_publishing": settings.x_publishing_enabled,
                 },

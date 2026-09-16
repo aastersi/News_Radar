@@ -1,4 +1,5 @@
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from typing import Protocol
@@ -11,6 +12,7 @@ from qmemo_radar.domain import (
     EventCandidate,
     EventStatus,
     FeedbackAction,
+    Metric,
     OutboxStatus,
     PipelineCounters,
     PipelineRun,
@@ -38,10 +40,31 @@ class Ranker(Protocol):
     async def rank(self, events: Sequence[EventCandidate]) -> list[ScoreResult]: ...
 
 
+@dataclass(frozen=True, slots=True)
+class KnownEvents:
+    """What storage already holds for a batch of candidates."""
+
+    ids: frozenset[tuple[str, str]]  # (source, external_id)
+    urls: frozenset[tuple[str, str]]  # (source, url)
+    content_owners: Mapping[str, str]  # content_hash -> earliest non-duplicate event id
+
+
 class EventRepository(Protocol):
     async def initialize(self) -> None: ...
 
     async def add_event(self, event: EventCandidate) -> bool: ...
+
+    async def find_known(self, events: Sequence[EventCandidate]) -> KnownEvents: ...
+
+    async def add_events(self, events: Sequence[EventCandidate]) -> int:
+        """INSERT OR IGNORE all events in one transaction; returns how many rows were new."""
+        ...
+
+    async def record_metrics(
+        self, run_id: str, metrics: Mapping[str, Mapping[Metric, int]]
+    ) -> None: ...
+
+    async def metrics_since(self, since: datetime) -> dict[str, dict[str, int]]: ...
 
     async def list_events_by_status(
         self,

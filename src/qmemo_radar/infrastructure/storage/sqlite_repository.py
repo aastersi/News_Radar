@@ -1,6 +1,6 @@
 import json
 import sqlite3
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from decimal import ROUND_CEILING, Decimal
@@ -9,6 +9,7 @@ from pathlib import Path
 
 import aiosqlite
 
+from qmemo_radar.application.ports import KnownEvents
 from qmemo_radar.domain import (
     CostEntry,
     DeliveryKind,
@@ -19,6 +20,7 @@ from qmemo_radar.domain import (
     EventStatus,
     FactCheckStatus,
     FeedbackAction,
+    Metric,
     OutboxStatus,
     PipelineCounters,
     PipelineRun,
@@ -35,6 +37,15 @@ _APPLIED_VERSIONS = "SELECT version FROM schema_migrations"
 _SCORED_EVENTS = """
     SELECT e.*, s.* FROM radar_events e
     JOIN event_scores s ON s.event_id = e.id
+"""
+_INSERT_EVENT = """
+    INSERT OR IGNORE INTO radar_events (
+        id, source, external_id, url, author_id, author_handle,
+        author_display_name, original_text, normalized_text,
+        content_hash, language, published_at, discovered_at,
+        engagement_json, raw_payload_json, status, created_at, updated_at,
+        source_key, filter_reason, duplicate_of_event_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 _EXPIRABLE = (
     EventStatus.DISCOVERED,
@@ -69,42 +80,90 @@ class SQLiteEventRepository:
             await db.commit()
 
     async def add_event(self, event: EventCandidate) -> bool:
+        return await self.add_events([event]) == 1
+
+    async def add_events(self, events: Sequence[EventCandidate]) -> int:
+        if not events:
+            return 0
         now = datetime.now(UTC).isoformat()
+        async with self._transaction() as db:
+            before = db.total_changes
+            await db.executemany(_INSERT_EVENT, [_event_row(event, now) for event in events])
+            return db.total_changes - before
+
+    async def find_known(self, events: Sequence[EventCandidate]) -> KnownEvents:
+        by_source: dict[str, list[EventCandidate]] = {}
+        for event in events:
+            by_source.setdefault(event.source.value, []).append(event)
+        ids: set[tuple[str, str]] = set()
+        urls: set[tuple[str, str]] = set()
+        owners: dict[str, str] = {}
         async with self._connect() as db:
-            cursor = await db.execute(
+            for source, group in by_source.items():
+                external_ids = [event.external_id for event in group]
+                rows = await db.execute_fetchall(
+                    f"SELECT external_id FROM radar_events WHERE source = ? "
+                    f"AND external_id IN ({_placeholders(external_ids)})",
+                    (source, *external_ids),
+                )
+                ids.update((source, str(row[0])) for row in rows)
+                group_urls = [str(event.url) for event in group]
+                rows = await db.execute_fetchall(
+                    f"SELECT url FROM radar_events WHERE source = ? "
+                    f"AND url IN ({_placeholders(group_urls)})",
+                    (source, *group_urls),
+                )
+                urls.update((source, str(row[0])) for row in rows)
+            hashes = sorted({event.content_hash for event in events})
+            if hashes:
+                rows = await db.execute_fetchall(
+                    f"""
+                    SELECT content_hash, id, MIN(rowid) FROM radar_events
+                    WHERE content_hash IN ({_placeholders(hashes)})
+                      AND COALESCE(filter_reason, '') != 'duplicate_content'
+                    GROUP BY content_hash
+                    """,
+                    hashes,
+                )
+                owners = {str(row[0]): str(row[1]) for row in rows}
+        return KnownEvents(ids=frozenset(ids), urls=frozenset(urls), content_owners=owners)
+
+    async def record_metrics(
+        self, run_id: str, metrics: Mapping[str, Mapping[Metric, int]]
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        rows = [
+            (run_id, source_key, metric.value, value, now)
+            for source_key, values in metrics.items()
+            for metric, value in values.items()
+            if value
+        ]
+        if not rows:
+            return
+        async with self._transaction() as db:
+            await db.executemany(
                 """
-                INSERT OR IGNORE INTO radar_events (
-                    id, source, external_id, url, author_id, author_handle,
-                    author_display_name, original_text, normalized_text,
-                    content_hash, language, published_at, discovered_at,
-                    engagement_json, raw_payload_json, status, created_at, updated_at,
-                    source_key
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO pipeline_metrics (run_id, source_key, metric, value, recorded_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(run_id, source_key, metric) DO UPDATE SET
+                    value = value + excluded.value
                 """,
-                (
-                    event.event_id,
-                    event.source.value,
-                    event.external_id,
-                    str(event.url),
-                    event.author_id,
-                    event.author_handle,
-                    event.author_display_name,
-                    event.original_text,
-                    event.normalized_text,
-                    event.content_hash,
-                    event.language,
-                    event.published_at.isoformat(),
-                    event.discovered_at.isoformat(),
-                    event.engagement.model_dump_json(),
-                    json.dumps(event.raw_payload, ensure_ascii=False, default=str),
-                    event.status.value,
-                    now,
-                    now,
-                    event.source_key,
-                ),
+                rows,
             )
-            await db.commit()
-            return cursor.rowcount == 1
+
+    async def metrics_since(self, since: datetime) -> dict[str, dict[str, int]]:
+        async with self._connect() as db:
+            rows = await db.execute_fetchall(
+                """
+                SELECT source_key, metric, SUM(value) FROM pipeline_metrics
+                WHERE recorded_at >= ? GROUP BY source_key, metric ORDER BY source_key, metric
+                """,
+                (since.astimezone(UTC).isoformat(),),
+            )
+        result: dict[str, dict[str, int]] = {}
+        for source_key, metric, value in rows:
+            result.setdefault(str(source_key), {})[str(metric)] = int(value)
+        return result
 
     async def set_status(
         self,
@@ -895,6 +954,8 @@ class SQLiteEventRepository:
                 "raw_payload": json.loads(values["raw_payload_json"]),
                 "status": values["status"],
                 "source_key": values["source_key"],
+                "filter_reason": values["filter_reason"],
+                "duplicate_of_event_id": values["duplicate_of_event_id"],
             }
         )
 
@@ -932,7 +993,33 @@ def _micros(usd: Decimal) -> int:
     return int((usd * _MICROS).to_integral_value(rounding=ROUND_CEILING))
 
 
-def _placeholders(values: list[str]) -> str:
+def _event_row(event: EventCandidate, now: str) -> tuple[object, ...]:
+    return (
+        event.event_id,
+        event.source.value,
+        event.external_id,
+        str(event.url),
+        event.author_id,
+        event.author_handle,
+        event.author_display_name,
+        event.original_text,
+        event.normalized_text,
+        event.content_hash,
+        event.language,
+        event.published_at.isoformat(),
+        event.discovered_at.isoformat(),
+        event.engagement.model_dump_json(),
+        json.dumps(event.raw_payload, ensure_ascii=False, default=str),
+        event.status.value,
+        now,
+        now,
+        event.source_key,
+        event.filter_reason,
+        event.duplicate_of_event_id,
+    )
+
+
+def _placeholders(values: Sequence[str]) -> str:
     return ",".join("?" for _ in values)
 
 
