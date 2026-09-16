@@ -381,3 +381,33 @@ def test_gdelt_is_opt_in_and_needs_no_key() -> None:
     assert RadarSettings(_env_file=None, gdelt_languages="*").gdelt_language_set is None  # type: ignore[call-arg]
     context = SourceContext(on, SourcesConfig(), x_client=None, free_http=httpx.AsyncClient())
     assert build_collector(context).names == ["gdelt_gqg"]
+
+
+async def test_poison_rows_are_skipped_and_never_stall_the_cursor(
+    repository: SQLiteEventRepository,
+) -> None:
+    # Regression: a lone surrogate or a deeply nested row used to crash the collector or the
+    # SQLite insert on every run, so the cursor never moved.
+    surrogate_quote = article("https://news.example/s1", FIRST)
+    surrogate_title = article("https://news.example/s2", SECOND) | {"title": "\ud800"}
+    surrogate_quote["quotes"] = [{"quote": "Lone \ud800 surrogate in the quote"}]
+    deep = b'{"quotes": ' + b"[" * 200_000 + b"]" * 200_000 + b"}"
+    normal = "A perfectly normal quote that must be stored"
+    good = article("https://news.example/good", normal)
+    rows = [json.dumps(row).encode() for row in (surrogate_quote, surrogate_title, good)]
+    body = gzip.compress(b"\n".join([rows[0], rows[1], deep, rows[2]]))
+    gdelt = Gdelt({minute("12:05"): body})
+
+    first = await pipeline(gdelt.collector(), repository).run_once()
+    with sqlite3.connect(repository._db_path) as db:
+        db.execute("DELETE FROM source_checkpoints")
+    second = await pipeline(gdelt.collector(), repository).run_once()
+
+    assert (first.inserted, first.source_errors) == (1, 0)
+    assert (second.inserted, second.source_errors) == (0, 0)
+    assert [row[1] for row in stored(repository)] == [normal]
+    assert await repository.get_checkpoints() == {SOURCE_KEY: minute("12:21")}
+    metrics = (await repository.metrics_since(datetime(2000, 1, 1, tzinfo=UTC)))[SOURCE_KEY]
+    assert metrics["malformed_rows"] == 2  # the deep row, once per run
+    assert metrics["quotes_rejected"] == 2  # the surrogate quote, once per run
+    assert metrics["invalid_items"] == 2  # the surrogate title reaches the pipeline and stops there

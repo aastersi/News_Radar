@@ -28,6 +28,7 @@ class Metric(StrEnum):
     EXACT_DUPLICATES = "exact_duplicates"  # already stored, or identical text to an earlier item
     FILTERED = "filtered"  # rejected by deterministic rules
     SOURCE_ERRORS = "source_errors"
+    INVALID_ITEMS = "invalid_items"  # could not be normalized or stored (e.g. broken Unicode)
     # Reserved names for the future preselection chain; nothing records them yet.
     NEAR_DUPLICATES = "near_duplicates"
     CLUSTERS_CREATED = "clusters_created"

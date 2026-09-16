@@ -1,3 +1,4 @@
+import json
 import logging
 from collections import Counter, defaultdict
 from collections.abc import Sequence
@@ -205,7 +206,14 @@ class RadarPipeline:
         and before ranking; they must not be added here.
         """
         now = datetime.now(UTC)
-        events = [build_candidate(item, discovered_at=now) for item in items]
+        events: list[EventCandidate] = []
+        for item in items:
+            try:
+                events.append(_storable(build_candidate(item, discovered_at=now)))
+            except ValueError:
+                # One bad upstream item must not abort the run: the cursor would never move and
+                # every run would fail on it again.
+                stats[Metric.INVALID_ITEMS] += 1
         known = await self._repository.find_known(events)
         ids, urls = set(known.ids), set(known.urls)
         owners = dict(known.content_owners)
@@ -246,6 +254,15 @@ class RadarPipeline:
         if total >= self._thresholds.digest:
             return EventStatus.SHORTLISTED
         return EventStatus.ARCHIVED
+
+
+def _storable(event: EventCandidate) -> EventCandidate:
+    """Raise UnicodeEncodeError (a ValueError) for text SQLite cannot store, e.g. a lone
+    surrogate decoded from a JSON escape."""
+    texts = (event.original_text, event.author_handle, event.author_display_name, event.language)
+    "".join(text or "" for text in texts).encode()
+    json.dumps(event.raw_payload, ensure_ascii=False, default=str).encode()
+    return event
 
 
 def _batches[T](items: Sequence[T], *, size: int) -> list[list[T]]:

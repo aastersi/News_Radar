@@ -28,7 +28,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
-from pydantic import HttpUrl, ValidationError
+from pydantic import HttpUrl
 
 from qmemo_radar.domain import RawSourceItem, SourceFetch, SourceType
 from qmemo_radar.infrastructure.http import HttpFailure, Sleep, get_limited
@@ -131,7 +131,10 @@ class GdeltQuotationCollector:
                     if oversized:
                         stats["malformed_rows"] += 1
                     elif line.strip():
-                        items.extend(self._article(line, name, stats))
+                        try:
+                            items.extend(self._article(line, name, stats))
+                        except Exception:  # any row the checks below missed: skip, never stall
+                            stats["malformed_rows"] += 1
         except (OSError, EOFError, zlib.error) as exc:  # gzip.BadGzipFile is an OSError
             stats["files_corrupt"] += 1
             _warn("gdelt file corrupt", minute, type(exc).__name__)
@@ -221,7 +224,7 @@ class GdeltQuotationCollector:
                 },
                 source_key=SOURCE_KEY,
             )
-        except ValidationError:
+        except ValueError:  # pydantic ValidationError, or text with lone surrogates
             stats["quotes_rejected"] += 1
             return None
 
