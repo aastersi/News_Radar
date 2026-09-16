@@ -76,6 +76,8 @@ class ScoreResult(DomainModel):
     fact_check_note: str | None = None
     prompt_version: str = "deterministic-v1"
     model_name: str = "none"
+    headline: str = Field(default="", max_length=160)
+    summary: str = Field(default="", max_length=600)
 
 
 class PublicationPackage(DomainModel):
@@ -115,4 +117,5 @@ class PipelineCounters(BaseModel):
     shortlisted: int = 0
     archived: int = 0
     source_errors: int = 0
+    rank_failed: int = 0
 

@@ -44,6 +44,7 @@ include = [
 addopts = "-q"
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = ["live: calls a real external API; runs only when explicitly enabled"]
 
 [tool.ruff]
 target-version = "py312"

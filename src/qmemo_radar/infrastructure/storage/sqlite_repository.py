@@ -138,8 +138,8 @@ class SQLiteEventRepository:
                     freshness, clarity, action_likelihood, risk_penalty, total,
                     rationale, recommended_format, target_action,
                     fact_check_required, fact_check_note, prompt_version,
-                    model_name, scored_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    model_name, scored_at, headline, summary
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(event_id) DO UPDATE SET
                     qmemo_relevance = excluded.qmemo_relevance,
                     quote_strength = excluded.quote_strength,
@@ -156,7 +156,9 @@ class SQLiteEventRepository:
                     fact_check_note = excluded.fact_check_note,
                     prompt_version = excluded.prompt_version,
                     model_name = excluded.model_name,
-                    scored_at = excluded.scored_at
+                    scored_at = excluded.scored_at,
+                    headline = excluded.headline,
+                    summary = excluded.summary
                 """,
                 (
                     score.event_id,
@@ -176,6 +178,8 @@ class SQLiteEventRepository:
                     score.prompt_version,
                     score.model_name,
                     now,
+                    score.headline,
+                    score.summary,
                 ),
             )
             cursor = await db.execute(
@@ -255,11 +259,11 @@ class SQLiteEventRepository:
                 """
                 SELECT 1 FROM radar_events
                 WHERE content_hash = ?
-                  AND (discovered_at, id) < (?, ?)
+                  AND rowid < (SELECT rowid FROM radar_events WHERE id = ?)
                   AND COALESCE(filter_reason, '') != 'duplicate_content'
                 LIMIT 1
                 """,
-                (event.content_hash, event.discovered_at.isoformat(), event.event_id),
+                (event.content_hash, event.event_id),
             )
         return bool(rows)
 

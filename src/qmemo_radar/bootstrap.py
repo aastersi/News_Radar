@@ -14,6 +14,7 @@ from qmemo_radar.infrastructure.collectors.x_api import (
     XQuery,
     XRecentSearchCollector,
 )
+from qmemo_radar.infrastructure.llm import ChatCompletionsClient
 from qmemo_radar.infrastructure.storage import SQLiteEventRepository
 
 
@@ -87,4 +88,22 @@ def build_x_collector(
         queries,
         lookback=timedelta(minutes=settings.max_event_age_minutes),
         max_pages=sources.x.max_pages_per_query,
+    )
+
+
+def build_llm_client(settings: RadarSettings, http: httpx.AsyncClient) -> ChatCompletionsClient:
+    if not settings.llm_model:
+        raise ValueError("RADAR_LLM_MODEL is required")
+    return ChatCompletionsClient(
+        http, model=settings.llm_model, temperature=settings.llm_temperature
+    )
+
+
+def build_llm_http_client(settings: RadarSettings) -> httpx.AsyncClient:
+    if not settings.llm_base_url or settings.llm_api_key is None:
+        raise ValueError("RADAR_LLM_BASE_URL and RADAR_LLM_API_KEY are required")
+    return httpx.AsyncClient(
+        base_url=settings.llm_base_url,
+        headers={"Authorization": f"Bearer {settings.llm_api_key.get_secret_value()}"},
+        timeout=httpx.Timeout(120.0, connect=10.0),
     )

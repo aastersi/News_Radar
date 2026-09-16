@@ -7,6 +7,7 @@ from qmemo_radar.application.normalization import build_candidate
 from qmemo_radar.application.ports import EventRepository, Ranker, SourceCollector
 from qmemo_radar.application.scoring import calculate_total
 from qmemo_radar.domain import EventCandidate, EventStatus, PipelineCounters, ScoreResult
+from qmemo_radar.exceptions import RankingFailed
 
 logger = logging.getLogger(__name__)
 
@@ -95,12 +96,34 @@ class RadarPipeline:
             candidates.append(event)
 
         for batch in _batches(candidates, size=10):
-            results = await self._ranker.rank(batch)
-            by_id = _validate_results(batch, results)
+            try:
+                by_id = _validate_results(batch, await self._ranker.rank(batch))
+            except RankingFailed as exc:
+                # Unscored events stay DISCOVERED: they are never shown and are retried next run.
+                counters.rank_failed += len(batch)
+                logger.warning(
+                    "ranking batch failed",
+                    extra={
+                        "run_id": run_id,
+                        "operation": "rank",
+                        "result": f"failed_batch={len(batch)}",
+                        "error_code": exc.code,
+                    },
+                )
+                continue
             for event in batch:
                 score = by_id[event.event_id]
                 next_status = self._status_for_score(score.total)
                 await self._repository.save_score_and_status(score, next_status)
+                logger.info(
+                    "event scored",
+                    extra={
+                        "run_id": run_id,
+                        "event_id": event.event_id,
+                        "operation": "rank",
+                        "result": f"{next_status.value}:{score.total}",
+                    },
+                )
                 counters.scored += 1
                 if next_status is EventStatus.SHORTLISTED:
                     counters.shortlisted += 1
@@ -126,9 +149,9 @@ def _validate_results(
     expected_ids = {event.event_id for event in events}
     result_ids = [result.event_id for result in results]
     if len(result_ids) != len(set(result_ids)):
-        raise ValueError("Ranker returned duplicate event ids")
+        raise RankingFailed("duplicate_event_ids")
     if set(result_ids) != expected_ids:
-        raise ValueError("Ranker result ids do not match the input batch")
+        raise RankingFailed("unexpected_event_ids")
 
     validated: dict[str, ScoreResult] = {}
     for result in results:

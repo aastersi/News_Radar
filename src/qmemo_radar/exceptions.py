@@ -16,3 +16,11 @@ class SourceUnavailable(RadarError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+class RankingFailed(RadarError):
+    """A ranking batch could not be scored with a valid structured result."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code

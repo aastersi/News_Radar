@@ -10,8 +10,15 @@ from qmemo_radar.infrastructure.storage import SQLiteEventRepository
 
 
 @pytest.fixture(autouse=True)
-def _block_external_network(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No test may reach X, an LLM, Telegram or Quote Memorial. Loopback stays open for asyncio."""
+def _block_external_network(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No test may reach X, an LLM, Telegram or Quote Memorial. Loopback stays open for asyncio.
+
+    Only tests marked `live` (opt-in, skipped by default) may use the network.
+    """
+    if request.node.get_closest_marker("live"):
+        return
     original_connect = socket.socket.connect
 
     def guarded_connect(self: socket.socket, address: Any) -> Any:

@@ -29,6 +29,7 @@ class RadarSettings(BaseSettings):
     llm_base_url: str | None = None
     llm_api_key: SecretStr | None = None
     llm_model: str | None = None
+    llm_temperature: float = Field(default=0.0, ge=0.0, le=1.0)
 
     collect_interval_minutes: int = Field(default=30, ge=5, le=1440)
     max_event_age_minutes: int = Field(default=60, ge=5, le=10080)
