@@ -9,20 +9,30 @@ import aiosqlite
 
 from qmemo_radar.domain import Engagement, EventCandidate, EventStatus, ScoreResult
 
+_MIGRATIONS = "qmemo_radar.infrastructure.storage.migrations"
+_APPLIED_VERSIONS = "SELECT version FROM schema_migrations"
+
 
 class SQLiteEventRepository:
     def __init__(self, db_path: Path) -> None:
         self._db_path = db_path
 
     async def initialize(self) -> None:
+        """Apply every packaged migration that is not recorded yet, in file-name order."""
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        migration = (
-            files("qmemo_radar.infrastructure.storage.migrations")
-            .joinpath("001_initial.sql")
-            .read_text(encoding="utf-8")
+        migrations = sorted(
+            (item for item in files(_MIGRATIONS).iterdir() if item.name.endswith(".sql")),
+            key=lambda item: item.name,
         )
         async with self._connect() as db:
-            await db.executescript(migration)
+            await db.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+            )
+            applied = {row[0] for row in await db.execute_fetchall(_APPLIED_VERSIONS)}
+            for migration in migrations:
+                if int(migration.name.split("_", 1)[0]) not in applied:
+                    await db.executescript(migration.read_text(encoding="utf-8"))
             await db.commit()
 
     async def add_event(self, event: EventCandidate) -> bool:
@@ -34,8 +44,9 @@ class SQLiteEventRepository:
                     id, source, external_id, url, author_id, author_handle,
                     author_display_name, original_text, normalized_text,
                     content_hash, language, published_at, discovered_at,
-                    engagement_json, raw_payload_json, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    engagement_json, raw_payload_json, status, created_at, updated_at,
+                    source_key
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event.event_id,
@@ -56,6 +67,7 @@ class SQLiteEventRepository:
                     event.status.value,
                     now,
                     now,
+                    event.source_key,
                 ),
             )
             await db.commit()
@@ -193,6 +205,64 @@ class SQLiteEventRepository:
             rows = await cursor.fetchall()
             return {str(row[0]): int(row[1]) for row in rows}
 
+    async def get_checkpoints(self) -> dict[str, str]:
+        async with self._connect() as db:
+            rows = await db.execute_fetchall(
+                "SELECT source_key, cursor_value FROM source_checkpoints "
+                "WHERE cursor_value IS NOT NULL"
+            )
+        return {str(row[0]): str(row[1]) for row in rows}
+
+    async def record_source_result(
+        self,
+        source_key: str,
+        *,
+        cursor: str | None,
+        error_code: str | None,
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        async with self._connect() as db:
+            if error_code is None:
+                await db.execute(
+                    """
+                    INSERT INTO source_checkpoints (source_key, cursor_value, last_success_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(source_key) DO UPDATE SET
+                        cursor_value = COALESCE(excluded.cursor_value, cursor_value),
+                        last_success_at = excluded.last_success_at,
+                        consecutive_failures = 0
+                    """,
+                    (source_key, cursor, now),
+                )
+            else:
+                await db.execute(
+                    """
+                    INSERT INTO source_checkpoints (
+                        source_key, last_error_at, last_error, consecutive_failures
+                    ) VALUES (?, ?, ?, 1)
+                    ON CONFLICT(source_key) DO UPDATE SET
+                        last_error_at = excluded.last_error_at,
+                        last_error = excluded.last_error,
+                        consecutive_failures = consecutive_failures + 1
+                    """,
+                    (source_key, now, error_code),
+                )
+            await db.commit()
+
+    async def has_earlier_content_duplicate(self, event: EventCandidate) -> bool:
+        async with self._connect() as db:
+            rows = await db.execute_fetchall(
+                """
+                SELECT 1 FROM radar_events
+                WHERE content_hash = ?
+                  AND (discovered_at, id) < (?, ?)
+                  AND COALESCE(filter_reason, '') != 'duplicate_content'
+                LIMIT 1
+                """,
+                (event.content_hash, event.discovered_at.isoformat(), event.event_id),
+            )
+        return bool(rows)
+
     @staticmethod
     def _event_from_row(row: aiosqlite.Row) -> EventCandidate:
         values = dict(row)
@@ -214,6 +284,7 @@ class SQLiteEventRepository:
                 "engagement": Engagement.model_validate_json(values["engagement_json"]),
                 "raw_payload": json.loads(values["raw_payload_json"]),
                 "status": values["status"],
+                "source_key": values["source_key"],
             }
         )
 

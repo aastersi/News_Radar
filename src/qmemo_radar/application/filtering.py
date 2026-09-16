@@ -1,7 +1,11 @@
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from qmemo_radar.domain import EventCandidate
+
+MANUAL_SOURCE_KEY = "manual"
+_NOISE = re.compile(r"https?://\S+|[@#$]\w+")
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,11 +27,13 @@ def first_filter_reason(
     if published_at.tzinfo is None:
         published_at = published_at.replace(tzinfo=UTC)
 
-    if published_at < current - policy.max_age:
+    # A manually submitted link is an explicit choice, so only automated sources are age-limited.
+    if event.source_key != MANUAL_SOURCE_KEY and published_at < current - policy.max_age:
         return "too_old"
-    if event.author_handle and event.author_handle.casefold() in policy.blocked_authors:
+    author_keys = {event.author_handle.casefold() if event.author_handle else None, event.author_id}
+    if author_keys & policy.blocked_authors:
         return "blocked_author"
-    if len(event.normalized_text) < policy.minimum_text_length:
+    if len(_NOISE.sub("", event.normalized_text).strip()) < policy.minimum_text_length:
         return "too_short"
     if any(term in event.normalized_text for term in policy.blocked_terms):
         return "blocked_term"

@@ -9,6 +9,9 @@ from pydantic import HttpUrl
 from qmemo_radar.domain import EventCandidate, RawSourceItem
 
 _WHITESPACE = re.compile(r"\s+")
+_X_STATUS_URL = re.compile(
+    r"https://x\.com/(?P<handle>[A-Za-z0-9_]{1,15})/status/(?P<post_id>[0-9]{1,19})/?(?:\?[^\s#]*)?"
+)
 _TRACKING_PARAMETERS = {
     "fbclid",
     "gclid",
@@ -62,3 +65,9 @@ def build_candidate(
         normalized_text=normalized,
         content_hash=content_hash,
     )
+
+
+def parse_x_status_url(value: str) -> str | None:
+    """Return the post id only for https://x.com/<handle>/status/<id>; anything else is rejected."""
+    match = _X_STATUS_URL.fullmatch(value.strip())
+    return match.group("post_id") if match else None

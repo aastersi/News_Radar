@@ -9,3 +9,10 @@ class PublishingDisabled(RadarError):
 class ProductionAdapterNotConfigured(RadarError):
     """Raised when run mode is requested before production adapters are wired."""
 
+
+class SourceUnavailable(RadarError):
+    """A read-only source request failed after the allowed retries."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code

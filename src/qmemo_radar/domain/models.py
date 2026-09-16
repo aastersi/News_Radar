@@ -35,6 +35,16 @@ class RawSourceItem(DomainModel):
     published_at: datetime
     engagement: Engagement = Field(default_factory=Engagement)
     raw_payload: dict[str, object] = Field(default_factory=dict)
+    source_key: str | None = Field(default=None, max_length=80)
+
+
+class SourceFetch(DomainModel):
+    """One configured source query. Its cursor is saved only after all items are stored."""
+
+    source_key: str = Field(min_length=1, max_length=80)
+    items: tuple[RawSourceItem, ...] = ()
+    cursor: str | None = None
+    error_code: str | None = None
 
 
 class EventCandidate(RawSourceItem):
@@ -104,4 +114,5 @@ class PipelineCounters(BaseModel):
     scored: int = 0
     shortlisted: int = 0
     archived: int = 0
+    source_errors: int = 0
 

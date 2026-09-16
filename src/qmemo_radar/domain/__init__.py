@@ -12,6 +12,7 @@ from qmemo_radar.domain.models import (
     RawSourceItem,
     ScoreBreakdown,
     ScoreResult,
+    SourceFetch,
 )
 
 __all__ = [
@@ -25,6 +26,7 @@ __all__ = [
     "RawSourceItem",
     "ScoreBreakdown",
     "ScoreResult",
+    "SourceFetch",
     "SourceType",
 ]
 

@@ -1,4 +1,4 @@
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Protocol
 
 from qmemo_radar.domain import (
@@ -7,11 +7,18 @@ from qmemo_radar.domain import (
     PublicationPackage,
     RawSourceItem,
     ScoreResult,
+    SourceFetch,
 )
 
 
 class SourceCollector(Protocol):
-    async def collect(self) -> list[RawSourceItem]: ...
+    async def collect(self, checkpoints: Mapping[str, str]) -> list[SourceFetch]:
+        """Fetch each configured source independently; a failed source returns error_code."""
+        ...
+
+
+class PostLookup(Protocol):
+    async def lookup_post(self, post_id: str) -> RawSourceItem: ...
 
 
 class Ranker(Protocol):
@@ -46,6 +53,18 @@ class EventRepository(Protocol):
     ) -> None: ...
 
     async def count_by_status(self) -> dict[str, int]: ...
+
+    async def get_checkpoints(self) -> dict[str, str]: ...
+
+    async def record_source_result(
+        self,
+        source_key: str,
+        *,
+        cursor: str | None,
+        error_code: str | None,
+    ) -> None: ...
+
+    async def has_earlier_content_duplicate(self, event: EventCandidate) -> bool: ...
 
 
 class ReviewGateway(Protocol):

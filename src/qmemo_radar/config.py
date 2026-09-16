@@ -1,7 +1,8 @@
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import Field, SecretStr, model_validator
+import yaml
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -19,6 +20,7 @@ class RadarSettings(BaseSettings):
     log_level: str = "INFO"
     timezone: str = "Asia/Ho_Chi_Minh"
     db_path: Path = Path("data/radar.db")
+    sources_path: Path = Path("sources.yaml")
 
     telegram_bot_token: SecretStr | None = None
     allowed_telegram_id: int | None = None
@@ -56,3 +58,44 @@ class RadarSettings(BaseSettings):
     def ensure_data_directory(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
+
+
+class _SourcesModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class XAccountSource(_SourcesModel):
+    handle: str = Field(pattern=r"^[A-Za-z0-9_]{1,15}$")
+    enabled: bool = True
+
+
+class XQuerySource(_SourcesModel):
+    name: str = Field(pattern=r"^[a-z0-9_]{1,40}$")
+    query: str = Field(min_length=1, max_length=4096)
+    enabled: bool = True
+
+
+class XSources(_SourcesModel):
+    accounts: tuple[XAccountSource, ...] = ()
+    queries: tuple[XQuerySource, ...] = ()
+    max_pages_per_query: int = Field(default=3, ge=1, le=10)
+
+
+class SourcesConfig(_SourcesModel):
+    """Contents of sources.yaml: what to read from X and what to always drop."""
+
+    x: XSources = XSources()
+    blocked_authors: tuple[str, ...] = ()
+    blocked_terms: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_unique_keys(self) -> "SourcesConfig":
+        handles = [account.handle.casefold() for account in self.x.accounts]
+        names = [query.name for query in self.x.queries]
+        if len(handles) != len(set(handles)) or len(names) != len(set(names)):
+            raise ValueError("Account handles and query names in sources.yaml must be unique")
+        return self
+
+
+def load_sources(path: Path) -> SourcesConfig:
+    return SourcesConfig.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")) or {})

@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -6,6 +7,8 @@ from qmemo_radar.application.normalization import build_candidate
 from qmemo_radar.application.ports import EventRepository, Ranker, SourceCollector
 from qmemo_radar.application.scoring import calculate_total
 from qmemo_radar.domain import EventCandidate, EventStatus, PipelineCounters, ScoreResult
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,18 +36,34 @@ class RadarPipeline:
         self._filter_policy = filter_policy
         self._thresholds = thresholds
 
-    async def run_once(self) -> PipelineCounters:
+    async def run_once(self, *, run_id: str | None = None) -> PipelineCounters:
         counters = PipelineCounters()
-        raw_items = await self._collector.collect()
-        counters.collected = len(raw_items)
-
-        for raw_item in raw_items:
-            event = build_candidate(raw_item)
-            inserted = await self._repository.add_event(event)
-            if not inserted:
-                counters.duplicates += 1
+        checkpoints = await self._repository.get_checkpoints()
+        for fetch in await self._collector.collect(checkpoints):
+            log = {"run_id": run_id, "operation": "collect", "source_key": fetch.source_key}
+            if fetch.error_code:
+                counters.source_errors += 1
+                await self._repository.record_source_result(
+                    fetch.source_key, cursor=None, error_code=fetch.error_code
+                )
+                logger.warning(
+                    "source failed",
+                    extra={**log, "result": "failed", "error_code": fetch.error_code},
+                )
                 continue
-            counters.inserted += 1
+
+            counters.collected += len(fetch.items)
+            for raw_item in fetch.items:
+                inserted = await self._repository.add_event(build_candidate(raw_item))
+                if not inserted:
+                    counters.duplicates += 1
+                    continue
+                counters.inserted += 1
+            # A storage error above aborts the run: the cursor moves only after every item is saved.
+            await self._repository.record_source_result(
+                fetch.source_key, cursor=fetch.cursor, error_code=None
+            )
+            logger.info("source collected", extra={**log, "result": f"items={len(fetch.items)}"})
 
         pending = await self._repository.list_events_by_status(
             EventStatus.DISCOVERED,
@@ -53,12 +72,23 @@ class RadarPipeline:
         candidates: list[EventCandidate] = []
         for event in pending:
             reason = first_filter_reason(event, self._filter_policy)
+            if reason is None and await self._repository.has_earlier_content_duplicate(event):
+                reason = "duplicate_content"
             if reason:
                 await self._repository.set_status(
                     event.event_id,
                     EventStatus.FILTERED_OUT,
                     expected={EventStatus.DISCOVERED},
                     filter_reason=reason,
+                )
+                logger.info(
+                    "event filtered",
+                    extra={
+                        "run_id": run_id,
+                        "event_id": event.event_id,
+                        "operation": "filter",
+                        "result": reason,
+                    },
                 )
                 counters.filtered += 1
                 continue
