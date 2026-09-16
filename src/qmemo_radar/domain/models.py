@@ -119,3 +119,8 @@ class PipelineCounters(BaseModel):
     source_errors: int = 0
     rank_failed: int = 0
 
+
+
+class ScoredEvent(DomainModel):
+    event: EventCandidate
+    score: ScoreResult

@@ -1,11 +1,15 @@
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from typing import Protocol
 
 from qmemo_radar.domain import (
+    DeliveryKind,
     EventCandidate,
     EventStatus,
+    FeedbackAction,
     PublicationPackage,
     RawSourceItem,
+    ScoredEvent,
     ScoreResult,
     SourceFetch,
 )
@@ -67,12 +71,60 @@ class EventRepository(Protocol):
     async def has_earlier_content_duplicate(self, event: EventCandidate) -> bool: ...
 
 
-class ReviewGateway(Protocol):
-    async def send_candidates(
+class ReviewRepository(EventRepository, Protocol):
+    async def list_deliverable(
         self,
-        events: Sequence[EventCandidate],
-        scores: Sequence[ScoreResult],
-    ) -> None: ...
+        statuses: set[EventStatus],
+        *,
+        min_total: int,
+        limit: int,
+    ) -> list[ScoredEvent]: ...
+
+    async def record_delivery(
+        self,
+        event_id: str,
+        *,
+        chat_id: int,
+        message_id: int,
+        kind: DeliveryKind,
+        expected: set[EventStatus],
+    ) -> bool:
+        """Store the Telegram message id and mark the event NOTIFIED in one transaction."""
+        ...
+
+    async def count_deliveries_since(self, since: datetime) -> int: ...
+
+    async def list_delivered_since(self, since: datetime) -> list[ScoredEvent]: ...
+
+    async def list_scored_by_status(
+        self, status: EventStatus, *, limit: int
+    ) -> list[ScoredEvent]: ...
+
+    async def get_scored_event(self, event_id: str) -> ScoredEvent | None: ...
+
+    async def decide(
+        self,
+        event_id: str,
+        status: EventStatus,
+        *,
+        expected: set[EventStatus],
+        action: FeedbackAction,
+        telegram_user_id: int,
+    ) -> bool:
+        """Change the event status and store feedback atomically; False if the state moved on."""
+        ...
+
+    async def expire_events(self, discovered_before: datetime) -> int: ...
+
+    async def get_state(self, key: str) -> str | None: ...
+
+    async def set_state(self, key: str, value: str) -> None: ...
+
+
+class ReviewGateway(Protocol):
+    async def send_card(self, card: ScoredEvent, *, urgent: bool) -> int:
+        """Send a card and return the Telegram message id; raise DeliveryFailed on failure."""
+        ...
 
 
 class QuotePublisher(Protocol):

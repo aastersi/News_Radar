@@ -7,10 +7,31 @@ from pathlib import Path
 
 import aiosqlite
 
-from qmemo_radar.domain import Engagement, EventCandidate, EventStatus, ScoreResult
+from qmemo_radar.domain import (
+    DeliveryKind,
+    Engagement,
+    EventCandidate,
+    EventStatus,
+    FeedbackAction,
+    ScoreBreakdown,
+    ScoredEvent,
+    ScoreResult,
+)
 
 _MIGRATIONS = "qmemo_radar.infrastructure.storage.migrations"
 _APPLIED_VERSIONS = "SELECT version FROM schema_migrations"
+_SCORED_EVENTS = """
+    SELECT e.*, s.* FROM radar_events e
+    JOIN event_scores s ON s.event_id = e.id
+"""
+_EXPIRABLE = (
+    EventStatus.DISCOVERED,
+    EventStatus.SCORED,
+    EventStatus.SHORTLISTED,
+    EventStatus.NOTIFIED,
+    EventStatus.SNOOZED,
+    EventStatus.DRAFTED,
+)
 
 
 class SQLiteEventRepository:
@@ -267,6 +288,180 @@ class SQLiteEventRepository:
             )
         return bool(rows)
 
+    async def list_deliverable(
+        self,
+        statuses: set[EventStatus],
+        *,
+        min_total: int,
+        limit: int,
+    ) -> list[ScoredEvent]:
+        values = sorted(status.value for status in statuses)
+        async with self._connect() as db:
+            rows = await db.execute_fetchall(
+                f"""{_SCORED_EVENTS}
+                WHERE e.status IN ({_placeholders(values)})
+                  AND (s.total >= ? OR e.source_key = 'manual')
+                ORDER BY s.total DESC, e.published_at DESC
+                LIMIT ?
+                """,
+                (*values, min_total, limit),
+            )
+        return [self._scored_from_row(row) for row in rows]
+
+    async def record_delivery(
+        self,
+        event_id: str,
+        *,
+        chat_id: int,
+        message_id: int,
+        kind: DeliveryKind,
+        expected: set[EventStatus],
+    ) -> bool:
+        values = sorted(status.value for status in expected)
+        now = datetime.now(UTC).isoformat()
+        async with self._transaction() as db:
+            [(previous,)] = await db.execute_fetchall(
+                "SELECT COUNT(*) FROM telegram_deliveries WHERE event_id = ?", (event_id,)
+            )
+            await db.execute(
+                """
+                INSERT INTO telegram_deliveries (
+                    event_id, chat_id, message_id, delivery_type, delivered_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (event_id, chat_id, message_id, f"{kind.value}:{previous + 1}", now),
+            )
+            cursor = await db.execute(
+                f"""
+                UPDATE radar_events SET status = ?, updated_at = ?
+                WHERE id = ? AND status IN ({_placeholders(values)})
+                """,
+                (EventStatus.NOTIFIED.value, now, event_id, *values),
+            )
+            if cursor.rowcount != 1:
+                await db.rollback()
+                return False
+        return True
+
+    async def count_deliveries_since(self, since: datetime) -> int:
+        async with self._connect() as db:
+            [(count,)] = await db.execute_fetchall(
+                "SELECT COUNT(*) FROM telegram_deliveries WHERE delivered_at >= ?",
+                (since.astimezone(UTC).isoformat(),),
+            )
+        return int(count)
+
+    async def list_delivered_since(self, since: datetime) -> list[ScoredEvent]:
+        async with self._connect() as db:
+            rows = await db.execute_fetchall(
+                f"""{_SCORED_EVENTS}
+                WHERE e.id IN (
+                    SELECT event_id FROM telegram_deliveries WHERE delivered_at >= ?
+                )
+                ORDER BY s.total DESC
+                """,
+                (since.astimezone(UTC).isoformat(),),
+            )
+        return [self._scored_from_row(row) for row in rows]
+
+    async def list_scored_by_status(self, status: EventStatus, *, limit: int) -> list[ScoredEvent]:
+        async with self._connect() as db:
+            rows = await db.execute_fetchall(
+                f"{_SCORED_EVENTS} WHERE e.status = ? ORDER BY e.updated_at DESC LIMIT ?",
+                (status.value, limit),
+            )
+        return [self._scored_from_row(row) for row in rows]
+
+    async def get_scored_event(self, event_id: str) -> ScoredEvent | None:
+        async with self._connect() as db:
+            rows = list(await db.execute_fetchall(f"{_SCORED_EVENTS} WHERE e.id = ?", (event_id,)))
+        return self._scored_from_row(rows[0]) if rows else None
+
+    async def decide(
+        self,
+        event_id: str,
+        status: EventStatus,
+        *,
+        expected: set[EventStatus],
+        action: FeedbackAction,
+        telegram_user_id: int,
+    ) -> bool:
+        values = sorted(item.value for item in expected)
+        now = datetime.now(UTC).isoformat()
+        async with self._transaction() as db:
+            cursor = await db.execute(
+                f"""
+                UPDATE radar_events SET status = ?, updated_at = ?
+                WHERE id = ? AND status IN ({_placeholders(values)})
+                """,
+                (status.value, now, event_id, *values),
+            )
+            if cursor.rowcount != 1:
+                await db.rollback()
+                return False
+            await _insert_feedback(db, event_id, None, action, telegram_user_id, now)
+        return True
+
+    async def expire_events(self, discovered_before: datetime) -> int:
+        values = [status.value for status in _EXPIRABLE]
+        async with self._connect() as db:
+            cursor = await db.execute(
+                f"""
+                UPDATE radar_events SET status = ?, updated_at = ?
+                WHERE status IN ({_placeholders(values)}) AND discovered_at < ?
+                """,
+                (
+                    EventStatus.EXPIRED.value,
+                    datetime.now(UTC).isoformat(),
+                    *values,
+                    discovered_before.astimezone(UTC).isoformat(),
+                ),
+            )
+            await db.commit()
+            return cursor.rowcount
+
+    async def get_state(self, key: str) -> str | None:
+        async with self._connect() as db:
+            rows = list(
+                await db.execute_fetchall("SELECT value FROM radar_state WHERE key = ?", (key,))
+            )
+        return str(rows[0][0]) if rows else None
+
+    async def set_state(self, key: str, value: str) -> None:
+        async with self._connect() as db:
+            await db.execute(
+                """
+                INSERT INTO radar_state (key, value, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (key, value, datetime.now(UTC).isoformat()),
+            )
+            await db.commit()
+
+    @classmethod
+    def _scored_from_row(cls, row: aiosqlite.Row) -> ScoredEvent:
+        values = dict(row)
+        breakdown = ScoreBreakdown.model_validate(
+            {name: values[name] for name in ScoreBreakdown.model_fields}
+        )
+        score = ScoreResult(
+            event_id=values["event_id"],
+            breakdown=breakdown,
+            total=values["total"],
+            rationale=values["rationale"],
+            recommended_format=values["recommended_format"],
+            target_action=values["target_action"],
+            fact_check_required=bool(values["fact_check_required"]),
+            fact_check_note=values["fact_check_note"],
+            prompt_version=values["prompt_version"],
+            model_name=values["model_name"],
+            headline=values["headline"],
+            summary=values["summary"],
+        )
+        return ScoredEvent(event=cls._event_from_row(row), score=score)
+
     @staticmethod
     def _event_from_row(row: aiosqlite.Row) -> EventCandidate:
         values = dict(row)
@@ -293,6 +488,18 @@ class SQLiteEventRepository:
         )
 
     @asynccontextmanager
+    async def _transaction(self) -> AsyncIterator[aiosqlite.Connection]:
+        """BEGIN IMMEDIATE ... COMMIT; any exception rolls everything back."""
+        async with self._connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                yield db
+            except BaseException:
+                await db.rollback()
+                raise
+            await db.commit()
+
+    @asynccontextmanager
     async def _connect(self) -> AsyncIterator[aiosqlite.Connection]:
         db = await aiosqlite.connect(self._db_path)
         try:
@@ -304,3 +511,25 @@ class SQLiteEventRepository:
             yield db
         finally:
             await db.close()
+
+
+def _placeholders(values: list[str]) -> str:
+    return ",".join("?" for _ in values)
+
+
+async def _insert_feedback(
+    db: aiosqlite.Connection,
+    event_id: str,
+    draft_id: str | None,
+    action: FeedbackAction,
+    telegram_user_id: int,
+    now: str,
+    note: str | None = None,
+) -> None:
+    await db.execute(
+        """
+        INSERT INTO feedback (event_id, draft_id, action, note, telegram_user_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (event_id, draft_id, action.value, note, telegram_user_id, now),
+    )

@@ -2,7 +2,11 @@ import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from qmemo_radar.application.filtering import FilterPolicy, first_filter_reason
+from qmemo_radar.application.filtering import (
+    MANUAL_SOURCE_KEY,
+    FilterPolicy,
+    first_filter_reason,
+)
 from qmemo_radar.application.normalization import build_candidate
 from qmemo_radar.application.ports import EventRepository, Ranker, SourceCollector
 from qmemo_radar.application.scoring import calculate_total
@@ -113,7 +117,11 @@ class RadarPipeline:
                 continue
             for event in batch:
                 score = by_id[event.event_id]
-                next_status = self._status_for_score(score.total)
+                next_status = (
+                    EventStatus.SHORTLISTED  # a manual link was chosen by a person
+                    if event.source_key == MANUAL_SOURCE_KEY
+                    else self._status_for_score(score.total)
+                )
                 await self._repository.save_score_and_status(score, next_status)
                 logger.info(
                     "event scored",

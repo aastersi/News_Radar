@@ -24,3 +24,11 @@ class RankingFailed(RadarError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+class DeliveryFailed(RadarError):
+    """A Telegram message could not be sent; the event stays deliverable for a retry."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
