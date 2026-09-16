@@ -1,10 +1,10 @@
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
 import pytest
-from fakes import snowflake
+from fakes import open_guard, snowflake
 
 from qmemo_radar.application.filtering import FilterPolicy
 from qmemo_radar.application.normalization import parse_x_status_url
@@ -68,7 +68,7 @@ class Recorder:
         http = httpx.AsyncClient(
             base_url="https://api.x.com", transport=httpx.MockTransport(self.handler)
         )
-        return XApiClient(http, sleep=self.sleep)
+        return XApiClient(http, guard=open_guard(), sleep=self.sleep)
 
 
 def collector(recorder: Recorder, *queries: str, pages: int = 1) -> XRecentSearchCollector:
@@ -318,7 +318,7 @@ async def test_repeated_run_uses_checkpoint_and_creates_no_duplicates(
 
 
 class FailingRepository(SQLiteEventRepository):
-    async def add_event(self, event: EventCandidate) -> bool:
+    async def add_events(self, events: Sequence[EventCandidate]) -> int:
         raise RuntimeError("database is locked")
 
 

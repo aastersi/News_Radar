@@ -1,0 +1,270 @@
+"""Source registry: independent collectors, isolated failures, own checkpoints, no duplicates."""
+
+import sqlite3
+from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+
+import httpx
+import pytest
+
+from qmemo_radar.application.budget import BudgetGuard, PaidFeature
+from qmemo_radar.application.collection import MultiSourceCollector
+from qmemo_radar.application.filtering import FilterPolicy
+from qmemo_radar.application.normalization import build_candidate
+from qmemo_radar.application.pipeline import PipelineThresholds, RadarPipeline
+from qmemo_radar.application.ports import SourceCollector
+from qmemo_radar.bootstrap import (
+    SOURCE_REGISTRY,
+    SourceContext,
+    SourceRegistration,
+    build_collector,
+    enabled_sources,
+)
+from qmemo_radar.config import RadarSettings, SourcesConfig
+from qmemo_radar.domain import CostEntry, RawSourceItem, SourceFetch, SourceType
+from qmemo_radar.infrastructure.collectors.x_api import XApiClient
+from qmemo_radar.infrastructure.ranking import DeterministicFixtureRanker
+from qmemo_radar.infrastructure.storage import SQLiteEventRepository
+
+X_SOURCES = SourcesConfig.model_validate(
+    {"x": {"accounts": [{"handle": "founder"}], "queries": [{"name": "q", "query": "q"}]}}
+)
+X_ON = {"paid_sources_enabled": True, "x_paid_search_enabled": True}
+
+
+def article(source: SourceType, number: int) -> RawSourceItem:
+    return RawSourceItem(
+        source=source,
+        external_id=f"{source.value}-{number}",
+        url=f"https://news.example/{source.value}/{number}",
+        author_display_name="Newsroom",
+        original_text=f'The minister said: "Budget item {number} of {source.value} is final."',
+        published_at=datetime.now(UTC) - timedelta(minutes=5),
+    )
+
+
+class Feed:
+    """A free source that, like an RSS feed, returns its whole window on every poll."""
+
+    def __init__(self, key: str, items: list[RawSourceItem]) -> None:
+        self.key = key
+        self.items = items
+        self.seen: list[str | None] = []
+
+    async def collect(self, checkpoints: Mapping[str, str]) -> list[SourceFetch]:
+        self.seen.append(checkpoints.get(self.key))
+        cursor = str(len(self.items))
+        return [SourceFetch(source_key=self.key, items=tuple(self.items), cursor=cursor)]
+
+
+class Crashing:
+    async def collect(self, checkpoints: Mapping[str, str]) -> list[SourceFetch]:
+        raise RuntimeError("parser bug")
+
+
+class Reporting:
+    async def collect(self, checkpoints: Mapping[str, str]) -> list[SourceFetch]:
+        return [SourceFetch(source_key="bluesky:firehose", error_code="network_error")]
+
+
+def pipeline(collector: SourceCollector, repository: SQLiteEventRepository) -> RadarPipeline:
+    return RadarPipeline(
+        collector=collector,
+        ranker=DeterministicFixtureRanker(),
+        repository=repository,
+        filter_policy=FilterPolicy(max_age=timedelta(hours=1)),
+        thresholds=PipelineThresholds(),
+    )
+
+
+def settings(**values: object) -> RadarSettings:
+    return RadarSettings(_env_file=None, **values)  # type: ignore[arg-type]
+
+
+async def test_collectors_run_together_fail_alone_and_keep_their_own_checkpoints(
+    repository: SQLiteEventRepository,
+) -> None:
+    rss = Feed("rss:wire", [article(SourceType.RSS, n) for n in range(3)])
+    gdelt = Feed("gdelt:gqg", [article(SourceType.GDELT, n) for n in range(2)])
+    collector = MultiSourceCollector(
+        {"rss": rss, "broken": Crashing(), "gdelt": gdelt, "bluesky": Reporting()}
+    )
+
+    first = await pipeline(collector, repository).run_once()
+    second = await pipeline(collector, repository).run_once()
+
+    assert (first.collected, first.inserted, first.source_errors) == (5, 5, 2)
+    assert (second.collected, second.inserted, second.duplicates) == (5, 0, 5)
+    assert await repository.get_checkpoints() == {"rss:wire": "3", "gdelt:gqg": "2"}
+    assert rss.seen == [None, "3"] and gdelt.seen == [None, "2"]
+    health = {item.source_key: item for item in await repository.source_health()}
+    assert health["broken"].last_error == "collector_failed:RuntimeError"
+    assert health["broken"].consecutive_failures == 2
+    assert health["bluesky:firehose"].last_error == "network_error"
+    assert health["rss:wire"].consecutive_failures == 0
+    assert sum((await repository.count_by_status()).values()) == 5
+
+
+def test_disabled_x_is_never_built_and_needs_no_credentials() -> None:
+    assert enabled_sources(settings(), X_SOURCES) == []
+    # Paid flags off: no token, no client, and building the registry still succeeds.
+    assert build_collector(SourceContext(settings(), X_SOURCES, x_client=None)).names == []
+    # Flags on but nothing configured in sources.yaml: still disabled.
+    assert enabled_sources(settings(**X_ON), SourcesConfig()) == []
+
+    assert enabled_sources(settings(**X_ON), X_SOURCES) == ["x_search"]
+    with pytest.raises(ValueError, match="RADAR_X_BEARER_TOKEN"):
+        build_collector(SourceContext(settings(**X_ON), X_SOURCES, x_client=None))
+
+
+async def test_free_collector_keeps_working_when_the_budget_is_exhausted(
+    repository: SQLiteEventRepository,
+) -> None:
+    since = datetime(2000, 1, 1, tzinfo=UTC)
+    full = CostEntry(
+        provider="x",
+        operation="earlier",
+        units=2000,
+        estimated_cost_usd=Decimal(10),
+        created_at=datetime.now(UTC),
+    )
+    assert await repository.reserve_cost(full, since=since, limit_usd=Decimal(10))
+    requests: list[httpx.Request] = []
+    x_http = httpx.AsyncClient(
+        base_url="https://api.x.com",
+        transport=httpx.MockTransport(lambda r: requests.append(r) or httpx.Response(200)),
+    )
+    guard = BudgetGuard(
+        repository,
+        enabled=frozenset(PaidFeature),
+        hard_limit_usd=Decimal(10),
+        target_usd=Decimal(0),
+    )
+    rss = Feed("rss:wire", [article(SourceType.RSS, 1)])
+    registry = (
+        *SOURCE_REGISTRY,
+        SourceRegistration("rss", lambda _settings, _sources: True, lambda _context: rss),
+    )
+    context = SourceContext(settings(**X_ON), X_SOURCES, XApiClient(x_http, guard=guard))
+
+    counters = await pipeline(build_collector(context, registry), repository).run_once()
+
+    assert counters.inserted == 1 and counters.source_errors == 2
+    assert requests == []
+    health = {item.source_key: item.last_error for item in await repository.source_health()}
+    assert health == {
+        "account:founder": "hard_limit_reached",
+        "query:q": "hard_limit_reached",
+        "rss:wire": None,
+        # Each collector that ran without crashing also reports itself healthy.
+        "rss": None,
+        "x_search": None,
+    }
+
+
+async def test_ingestion_metrics_per_source(
+    repository: SQLiteEventRepository, caplog: pytest.LogCaptureFixture
+) -> None:
+    def rss(number: int, text: str, *, minutes_ago: int = 5) -> RawSourceItem:
+        return article(SourceType.RSS, number).model_copy(
+            update={
+                "original_text": text,
+                "published_at": datetime.now(UTC) - timedelta(minutes=minutes_ago),
+            }
+        )
+
+    shared = 'The minister said: "The wire story is identical everywhere today."'
+    feed = Feed(
+        "rss:wire",
+        [
+            rss(1, shared),
+            rss(2, 'The minister said: "An old statement from yesterday."', minutes_ago=600),
+            rss(3, "Too short"),
+            rss(4, shared),  # same text, different article
+            rss(5, 'The minister said: "A second fresh statement for the radar."'),
+            rss(5, 'The minister said: "A second fresh statement for the radar."'),  # repeated id
+        ],
+    )
+    gdelt = Feed(
+        "gdelt:gqg",
+        [
+            article(SourceType.GDELT, 1).model_copy(update={"original_text": shared}),
+            article(SourceType.GDELT, 2),
+        ],
+    )
+    collector = MultiSourceCollector({"rss": feed, "gdelt": gdelt, "broken": Crashing()})
+
+    first = await pipeline(collector, repository).run_once(run_id="run-1")
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        second = await pipeline(collector, repository).run_once(run_id="run-2")
+
+    assert (first.collected, first.inserted, first.duplicates, first.filtered) == (8, 7, 3, 2)
+    assert (first.source_errors, first.scored) == (1, 3)
+    assert (second.collected, second.inserted, second.duplicates, second.filtered) == (8, 0, 8, 0)
+    assert await repository.metrics_since(datetime(2000, 1, 1, tzinfo=UTC)) == {
+        "broken": {"source_errors": 2},
+        "gdelt:gqg": {"collected": 4, "exact_duplicates": 3, "inserted": 2},
+        "rss:wire": {"collected": 12, "exact_duplicates": 8, "filtered": 2, "inserted": 5},
+    }
+    with sqlite3.connect(repository._db_path) as db:
+        rows = db.execute(
+            "SELECT external_id, status, filter_reason, duplicate_of_event_id IS NOT NULL "
+            "FROM radar_events ORDER BY rowid"
+        ).fetchall()
+    assert rows == [
+        ("rss-1", "SHORTLISTED", None, 0),
+        ("rss-2", "FILTERED_OUT", "too_old", 0),
+        ("rss-3", "FILTERED_OUT", "too_short", 0),
+        ("rss-4", "FILTERED_OUT", "duplicate_content", 1),
+        ("rss-5", "SHORTLISTED", None, 0),
+        ("gdelt-1", "FILTERED_OUT", "duplicate_content", 1),
+        ("gdelt-2", "SHORTLISTED", None, 0),
+    ]
+    logged = {
+        getattr(record, "source_key", None): getattr(record, "result", None)
+        for record in caplog.records
+        if record.getMessage() == "source collected"
+    }
+    assert logged["rss:wire"] == "collected=6 exact_duplicates=6"
+
+
+async def test_collector_recovering_from_a_crash_clears_its_error(
+    repository: SQLiteEventRepository,
+) -> None:
+    class Flaky:
+        crash = True
+
+        async def collect(self, checkpoints: Mapping[str, str]) -> list[SourceFetch]:
+            if self.crash:
+                raise RuntimeError("temporary")
+            return []
+
+    flaky = Flaky()
+    collector = MultiSourceCollector({"flaky": flaky})
+    await pipeline(collector, repository).run_once()
+    flaky.crash = False
+    await pipeline(collector, repository).run_once()
+
+    [health] = await repository.source_health()
+    assert (health.source_key, health.consecutive_failures) == ("flaky", 0)
+
+
+async def test_copy_of_an_ignored_original_is_stored_without_a_dangling_link(
+    repository: SQLiteEventRepository,
+) -> None:
+    stored = build_candidate(article(SourceType.RSS, 1))
+    assert await repository.add_event(stored)  # e.g. a manual link stored between two awaits
+    # The ingest batch still believes its own copy of item 1 is the original.
+    original = build_candidate(article(SourceType.RSS, 1))
+    copy = build_candidate(article(SourceType.GDELT, 2)).model_copy(
+        update={"duplicate_of_event_id": original.event_id}
+    )
+
+    assert await repository.add_events([original, copy]) == 1
+    with sqlite3.connect(repository._db_path) as db:
+        rows = db.execute(
+            "SELECT id, external_id, duplicate_of_event_id FROM radar_events ORDER BY rowid"
+        ).fetchall()
+    assert rows == [(stored.event_id, "rss-1", None), (copy.event_id, "gdelt-2", None)]

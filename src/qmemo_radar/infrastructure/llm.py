@@ -4,10 +4,12 @@ import asyncio
 import json
 import logging
 from collections.abc import Callable
+from decimal import Decimal
 
 import httpx
 from pydantic import ValidationError
 
+from qmemo_radar.application.budget import BudgetGuard, PaidFeature
 from qmemo_radar.infrastructure.http import HttpFailure, Sleep, send_with_retry
 
 logger = logging.getLogger(__name__)
@@ -25,15 +27,30 @@ class ChatCompletionsClient:
         http: httpx.AsyncClient,
         *,
         model: str,
+        guard: BudgetGuard,
+        cost_per_call_usd: Decimal | None,
         temperature: float = 0.0,
         sleep: Sleep = asyncio.sleep,
     ) -> None:
         self._http = http
         self.model = model
+        self._guard = guard
+        self._cost_per_call_usd = cost_per_call_usd
         self._temperature = temperature
         self._sleep = sleep
 
     async def complete(self, messages: list[dict[str, str]], *, max_tokens: int) -> str:
+        """Raises BudgetBlocked before any request (including a retry) that is not allowed."""
+
+        async def reserve() -> None:
+            # Kept even if the attempt fails: a timed-out generation may still be billed.
+            await self._guard.reserve(
+                PaidFeature.LLM,
+                provider=self._http.base_url.host or "llm",
+                operation="chat_completions",
+                units=1,
+                cost_usd=self._cost_per_call_usd,
+            )
         payload = {
             "model": self.model,
             "messages": messages,
@@ -43,7 +60,12 @@ class ChatCompletionsClient:
             "response_format": {"type": "json_object"},
         }
         response = await send_with_retry(
-            self._http, "POST", "chat/completions", json=payload, sleep=self._sleep
+            self._http,
+            "POST",
+            "chat/completions",
+            json=payload,
+            sleep=self._sleep,
+            before_attempt=reserve,
         )
         try:
             content = response.json()["choices"][0]["message"]["content"]

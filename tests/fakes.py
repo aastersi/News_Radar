@@ -2,17 +2,19 @@
 
 import itertools
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from pydantic import HttpUrl
 
+from qmemo_radar.application.budget import BudgetGuard, PaidFeature
 from qmemo_radar.application.filtering import FilterPolicy
 from qmemo_radar.application.pipeline import PipelineThresholds, RadarPipeline
-from qmemo_radar.application.ports import DraftWriter, Ranker, SourceCollector
+from qmemo_radar.application.ports import CostLedger, DraftWriter, Ranker, SourceCollector
 from qmemo_radar.application.review import DeliveryLimits, ReviewService
 from qmemo_radar.bootstrap import Application, build_services
 from qmemo_radar.config import RadarSettings, SourcesConfig
-from qmemo_radar.domain import Engagement, RawSourceItem, ScoredEvent, SourceType
+from qmemo_radar.domain import CostEntry, Engagement, RawSourceItem, ScoredEvent, SourceType
 from qmemo_radar.exceptions import DeliveryFailed, SourceUnavailable
 from qmemo_radar.infrastructure.collectors import FakeCollector
 from qmemo_radar.infrastructure.drafting import DeterministicDraftWriter
@@ -29,6 +31,49 @@ def snowflake(sequence: int = 0, *, minutes_ago: float = 0) -> str:
     """A post id whose embedded timestamp is `minutes_ago` minutes in the past."""
     created_ms = int((datetime.now(UTC) - timedelta(minutes=minutes_ago)).timestamp() * 1000)
     return str(((created_ms - X_EPOCH_MS) << 22) + sequence)
+
+
+class MemoryLedger:
+    """In-memory CostLedger for adapter tests; the SQLite ledger has its own tests."""
+
+    def __init__(self) -> None:
+        self.entries: dict[int, CostEntry] = {}
+
+    async def reserve_cost(
+        self, entry: CostEntry, *, since: datetime, limit_usd: Decimal
+    ) -> tuple[int, Decimal] | None:
+        total = await self.cost_since(since) + entry.estimated_cost_usd
+        if total > limit_usd:
+            return None
+        entry_id = len(self.entries) + 1
+        self.entries[entry_id] = entry
+        return entry_id, total
+
+    async def settle_cost(self, entry_id: int, *, units: int, cost_usd: Decimal) -> None:
+        entry = self.entries[entry_id]
+        if cost_usd <= entry.estimated_cost_usd:
+            self.entries[entry_id] = entry.model_copy(
+                update={"units": units, "estimated_cost_usd": cost_usd}
+            )
+
+    async def cost_since(self, since: datetime) -> Decimal:
+        return sum(
+            (e.estimated_cost_usd for e in self.entries.values() if e.created_at >= since),
+            Decimal(0),
+        )
+
+
+def open_guard(ledger: CostLedger | None = None, *, limit_usd: str = "10") -> BudgetGuard:
+    """Every paid feature allowed, as an owner who enabled them would configure it."""
+    return BudgetGuard(
+        ledger or MemoryLedger(),
+        enabled=frozenset(PaidFeature),
+        hard_limit_usd=Decimal(limit_usd),
+        target_usd=Decimal(limit_usd),
+    )
+
+
+LLM_CALL_USD = Decimal("0.01")
 
 
 class FakeGateway:

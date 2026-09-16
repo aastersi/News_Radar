@@ -30,6 +30,14 @@ class RankingFailed(RadarError):
         self.retryable = retryable
 
 
+class BudgetBlocked(RadarError):
+    """A paid external call was refused before any request was sent."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
 class DeliveryFailed(RadarError):
     """A Telegram message could not be sent; the event stays deliverable for a retry."""
 

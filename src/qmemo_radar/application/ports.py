@@ -1,14 +1,18 @@
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from typing import Protocol
 
 from qmemo_radar.domain import (
+    CostEntry,
     DeliveryKind,
     Draft,
     DraftText,
     EventCandidate,
     EventStatus,
     FeedbackAction,
+    Metric,
     OutboxStatus,
     PipelineCounters,
     PipelineRun,
@@ -36,10 +40,37 @@ class Ranker(Protocol):
     async def rank(self, events: Sequence[EventCandidate]) -> list[ScoreResult]: ...
 
 
+@dataclass(frozen=True, slots=True)
+class KnownEvents:
+    """What storage already holds for a batch of candidates."""
+
+    ids: frozenset[tuple[str, str]]  # (source, external_id)
+    urls: frozenset[tuple[str, str]]  # (source, url)
+    content_owners: Mapping[str, str]  # content_hash -> earliest non-duplicate event id
+
+
 class EventRepository(Protocol):
     async def initialize(self) -> None: ...
 
     async def add_event(self, event: EventCandidate) -> bool: ...
+
+    async def find_known(self, events: Sequence[EventCandidate]) -> KnownEvents: ...
+
+    async def add_events(self, events: Sequence[EventCandidate]) -> int:
+        """INSERT OR IGNORE all events in one transaction; returns how many rows were new."""
+        ...
+
+    async def record_metrics(
+        self, run_id: str, metrics: Mapping[str, Mapping[Metric, int]]
+    ) -> None: ...
+
+    async def metrics_since(self, since: datetime) -> dict[str, dict[str, int]]: ...
+
+    async def count_prunable_noise(self, discovered_before: datetime) -> dict[str, int]:
+        """Events that retention may delete: FILTERED_OUT, EXPIRED or ARCHIVED, discovered before
+        the cutoff, never delivered, never drafted, without feedback or outbox package, and not
+        the original of a stored duplicate. Counted per status; nothing is deleted."""
+        ...
 
     async def list_events_by_status(
         self,
@@ -209,7 +240,22 @@ class OutboxRepository(DraftRepository, Protocol):
     async def count_packages(self, status: OutboxStatus) -> int: ...
 
 
-class RunRepository(OutboxRepository, Protocol):
+class CostLedger(Protocol):
+    async def reserve_cost(
+        self, entry: CostEntry, *, since: datetime, limit_usd: Decimal
+    ) -> tuple[int, Decimal] | None:
+        """Atomically store the entry only if spend since `since` plus the entry stays within
+        `limit_usd`. Returns (entry id, new total) or None when the limit would be exceeded."""
+        ...
+
+    async def settle_cost(self, entry_id: int, *, units: int, cost_usd: Decimal) -> None:
+        """Lower a reservation to the actual cost. A reservation is never raised."""
+        ...
+
+    async def cost_since(self, since: datetime) -> Decimal: ...
+
+
+class RunRepository(OutboxRepository, CostLedger, Protocol):
     async def start_run(self, run_id: str) -> None: ...
 
     async def finish_run(

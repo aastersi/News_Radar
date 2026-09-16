@@ -152,7 +152,7 @@ async def test_status_command_speaks_human_language(repository: SQLiteEventRepos
         "Пауза: выключена",
         "Последний сбор:",
         "Последний успешный сбор:",
-        "X: ошибки в 1 из 2 источников",
+        "Источники: ошибки в 1 из 2",
         "account:broken: client_error_401",
         "LLM: в порядке",
         "Сегодня: найдено 1 · отфильтровано 0 · оценено 1 · отправлено 1",

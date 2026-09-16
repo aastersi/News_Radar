@@ -8,8 +8,9 @@ from pathlib import Path
 
 from pydantic import HttpUrl
 
+from qmemo_radar.application.budget import month_start
 from qmemo_radar.application.runner import HEARTBEAT_KEY
-from qmemo_radar.bootstrap import build_application, build_services
+from qmemo_radar.bootstrap import build_application, build_services, enabled_sources
 from qmemo_radar.config import RadarSettings, SourcesConfig, load_sources
 from qmemo_radar.domain import (
     Engagement,
@@ -62,6 +63,7 @@ async def execute(command: str, *, db_path: Path | None = None) -> int:
     if command == "status":
         await app.repository.initialize()
         counts = await app.repository.count_by_status()
+        now = datetime.now(UTC)
         print(
             json.dumps(
                 {
@@ -69,6 +71,16 @@ async def execute(command: str, *, db_path: Path | None = None) -> int:
                     "database": str(settings.db_path),
                     "events": counts,
                     "outbox_approved": await app.repository.count_packages(OutboxStatus.APPROVED),
+                    "ingestion_24h": await app.repository.metrics_since(now - timedelta(days=1)),
+                    "cost_month_usd": str(await app.repository.cost_since(month_start(now))),
+                    "retention": {
+                        "raw_retention_days": settings.raw_retention_days,
+                        "prunable_events": await app.repository.count_prunable_noise(
+                            now - timedelta(days=settings.raw_retention_days)
+                        ),
+                        "automatic_deletion": False,
+                    },
+                    "cost_hard_limit_usd_monthly": str(settings.cost_hard_limit_usd_monthly),
                     "qmemo_publishing": settings.qmemo_publishing_enabled,
                     "x_publishing": settings.x_publishing_enabled,
                 },
@@ -139,6 +151,14 @@ def _check_config(settings: RadarSettings) -> int:
         else:
             summary["x_accounts"] = sum(item.enabled for item in sources.x.accounts)
             summary["x_queries"] = sum(item.enabled for item in sources.x.queries)
+            summary["sources_enabled"] = enabled_sources(settings, sources)
+    summary["paid"] = {
+        "sources": settings.paid_sources_enabled,
+        "x_search": settings.x_search_enabled,
+        "llm_ranking_and_drafts": settings.paid_llm_enabled,
+        "cost_target_usd_monthly": str(settings.cost_target_usd_monthly),
+        "cost_hard_limit_usd_monthly": str(settings.cost_hard_limit_usd_monthly),
+    }
     summary["status"] = "ok" if not problems else "invalid"
     summary["digest_times"] = [moment.strftime("%H:%M") for moment in settings.digest_schedule]
     print(json.dumps(summary, ensure_ascii=False))
@@ -152,7 +172,9 @@ async def _healthcheck(settings: RadarSettings) -> int:
         heartbeat = await SQLiteEventRepository(settings.db_path).get_state(HEARTBEAT_KEY)
     age = datetime.now(UTC) - datetime.fromisoformat(heartbeat) if heartbeat else None
     healthy = age is not None and age < HEARTBEAT_MAX_AGE
-    print(json.dumps({"healthy": healthy, "heartbeat_age_seconds": age and age.total_seconds()}))
+    # `is not None`: a zero timedelta is falsy, and the heartbeat may be written this instant.
+    seconds = age.total_seconds() if age is not None else None
+    print(json.dumps({"healthy": healthy, "heartbeat_age_seconds": seconds}))
     return 0 if healthy else 1
 
 

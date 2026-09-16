@@ -4,7 +4,17 @@ import sqlite3
 from typing import Any
 
 import httpx
-from fakes import OWNER_ID, FakeGateway, Inbox, review_service, seed, telegram, x_item
+from fakes import (
+    LLM_CALL_USD,
+    OWNER_ID,
+    FakeGateway,
+    Inbox,
+    open_guard,
+    review_service,
+    seed,
+    telegram,
+    x_item,
+)
 
 from qmemo_radar.application.drafting import (
     DraftOutcome,
@@ -254,7 +264,11 @@ class FakeDraftModel:
         http = httpx.AsyncClient(
             base_url="https://llm.test/v1", transport=httpx.MockTransport(self.handler)
         )
-        return LlmDraftWriter(ChatCompletionsClient(http, model="draft-model"))
+        return LlmDraftWriter(
+            ChatCompletionsClient(
+                http, model="draft-model", guard=open_guard(), cost_per_call_usd=LLM_CALL_USD
+            )
+        )
 
 
 def answer(**changes: Any) -> dict[str, Any]:

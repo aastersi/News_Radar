@@ -6,6 +6,8 @@ Radar изолирован от Brain, Dulty и сайта Quote Memorial: св�
 
 **Публикация в Quote Memorial и X не реализована и выключена.** Одобренный пакет только ждёт в outbox.
 
+**Внешние расходы: цель $0 в месяц, жёсткий предел $10.** X и LLM — платные функции и по умолчанию выключены; без флагов ни один платный API не вызывается. Radar переходит к бесплатным открытым источникам (GDELT, RSS и другие): основа готова, план подключения — [docs/MULTI_SOURCE.md](docs/MULTI_SOURCE.md).
+
 ## Что готово
 
 | Этап | Что делает |
@@ -17,6 +19,8 @@ Radar изолирован от Brain, Dulty и сайта Quote Memorial: св�
 | Черновик | точная цитата из источника, автор из источника, тексты для QMemo и X, одна переделка, ручная проверка фактов |
 | Outbox | атомарное одобрение, один пакет на публикацию, без внешних запросов |
 | Runtime | планировщик, `/run`, `/status`, пауза, JSON-журналы, healthcheck, корректная остановка |
+| Multi-source основа | реестр источников, пакетная загрузка, метрики по источникам, отчёт retention |
+| Бюджет | `BudgetGuard` и `cost_ledger`: платный вызов блокируется до запроса при выключенном флаге, неизвестной цене или месячном пределе |
 
 Путь `X → фильтр → ранжирование → SQLite → Telegram → черновик → одобрение → outbox` проверен сквозными тестами с поддельными X, LLM и Telegram и офлайн-командой `dry-run`. С настоящими ключами X, LLM и Telegram сервис в этом репозитории не запускался — это первый шаг пилота.
 
@@ -26,8 +30,8 @@ Radar изолирован от Brain, Dulty и сайта Quote Memorial: св�
 
 1. **Telegram-бот.** В [@BotFather](https://t.me/BotFather) выполните `/newbot` и сохраните токен. Это должен быть новый бот только для Radar.
 2. **Ваш Telegram ID.** Узнайте числовой ID, например, у [@userinfobot](https://t.me/userinfobot). Если ID указан неверно, бот ответит «Нет доступа» и покажет ID, с которого пришло сообщение.
-3. **X API.** В [console.x.com](https://console.x.com) создайте приложение, пополните кредиты (оплата за каждое прочитанное сообщение) и скопируйте **Bearer Token**. Нужны только операции чтения.
-4. **LLM.** Любой OpenAI-совместимый endpoint: base URL, ключ и название модели.
+3. **X API (платно, необязательно).** В [console.x.com](https://console.x.com) создайте приложение, пополните кредиты (оплата за каждое прочитанное сообщение) и скопируйте **Bearer Token**. Нужны только операции чтения. Включается флагами `RADAR_PAID_SOURCES_ENABLED=true` и `RADAR_X_PAID_SEARCH_ENABLED=true`.
+4. **LLM (платно, необязательно).** Любой OpenAI-совместимый endpoint: base URL, ключ, название модели и оценка стоимости одного запроса. Включается `RADAR_PAID_LLM_ENABLED=true`. Без LLM события собираются и фильтруются, но не оцениваются, поэтому карточек нет.
 
 Затем в корне репозитория:
 
@@ -64,10 +68,26 @@ docker compose up -d --build
 | --- | --- |
 | `RADAR_TELEGRAM_BOT_TOKEN` | токен отдельного бота Radar |
 | `RADAR_ALLOWED_TELEGRAM_ID` | единственный Telegram ID, которому бот отвечает |
+
+Расходы и платные функции:
+
+| Переменная | По умолчанию | Назначение |
+| --- | --- | --- |
+| `RADAR_COST_TARGET_USD_MONTHLY` | `0` | цель; превышение пишет предупреждение в журнал |
+| `RADAR_COST_HARD_LIMIT_USD_MONTHLY` | `10` | предел, не больше 10; платный вызов сверх него не отправляется |
+| `RADAR_PAID_SOURCES_ENABLED` | `false` | платные источники и lookup ручных ссылок X |
+| `RADAR_X_PAID_SEARCH_ENABLED` | `false` | X recent search (вместе с предыдущим) |
+| `RADAR_PAID_LLM_ENABLED` | `false` | LLM-ранжирование и черновики |
+
+Нужны только при включённых платных функциях:
+
+| Переменная | Назначение |
+| --- | --- |
 | `RADAR_X_BEARER_TOKEN` | Bearer Token приложения X (только чтение) |
 | `RADAR_LLM_BASE_URL` | OpenAI-совместимый base URL, например `https://api.openai.com/v1` или `https://api.anthropic.com/v1/` |
 | `RADAR_LLM_API_KEY` | ключ LLM-провайдера |
 | `RADAR_LLM_MODEL` | модель, например `claude-sonnet-5` |
+| `RADAR_LLM_COST_PER_CALL_USD` | верхняя оценка стоимости одного запроса; без неё платный LLM-вызов блокируется |
 
 Необязательные:
 
@@ -83,6 +103,7 @@ docker compose up -d --build
 | `RADAR_DIGEST_THRESHOLD` | `65` | порог попадания в подборку |
 | `RADAR_ARCHIVE_THRESHOLD` | `50` | нижняя граница, должна быть не выше порога подборки |
 | `RADAR_EVENT_TTL_HOURS` | `48` | через сколько часов нерешённое событие устаревает |
+| `RADAR_RAW_RETENTION_DAYS` | `14` | через сколько дней шум считается удаляемым (пока только отчёт в `status`) |
 | `RADAR_LLM_TEMPERATURE` | `0` | температура модели |
 | `RADAR_LOG_LEVEL` | `INFO` | уровень журналов |
 | `RADAR_DB_PATH` | `data/radar.db` | путь к SQLite (в Docker `/app/data/radar.db`) |
@@ -137,7 +158,7 @@ blocked_terms: [giveaway, airdrop]
 | `qmemo-radar run` | боевой режим: миграции, Telegram poller, планировщик |
 | `qmemo-radar check-config` | проверка переменных и `sources.yaml` без сети, код 78 при ошибке |
 | `qmemo-radar dry-run --db <path>` | офлайн-прогон полного пути до outbox |
-| `qmemo-radar status` | счётчики событий и outbox в JSON |
+| `qmemo-radar status` | события, outbox, поток по источникам за 24 часа, расходы за месяц, retention — в JSON |
 | `qmemo-radar healthcheck` | код 0, если планировщик отмечался последние 3 минуты |
 | `qmemo-radar init-db` | создать базу и применить миграции |
 
@@ -171,8 +192,15 @@ qmemo-radar dry-run --db data/dry-run.db
 RADAR_LIVE_LLM_EVAL=1 pytest -m live
 ```
 
+Нагрузочный тест на 200 000 объектов входит в обычный `pytest`; на 1 000 000 — по желанию:
+
+```bash
+RADAR_BENCHMARK_1M=1 pytest -s tests/test_throughput.py
+```
+
 ## Документы
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — устройство и контракты.
+- [docs/MULTI_SOURCE.md](docs/MULTI_SOURCE.md) — открытые источники, бюджет, метрики, retention, план M3.
 - [docs/PILOT.md](docs/PILOT.md) — недельный пилот.
 - [SECURITY.md](SECURITY.md) — секреты и защита от публикации.

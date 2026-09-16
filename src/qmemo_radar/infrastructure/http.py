@@ -30,13 +30,24 @@ async def send_with_retry(
     attempts: int = 3,
     max_wait_seconds: float = 60.0,
     sleep: Sleep = asyncio.sleep,
+    before_attempt: Callable[[], Awaitable[None]] | None = None,
+    after_attempt: Callable[[httpx.Response | None], Awaitable[None]] | None = None,
 ) -> httpx.Response:
-    """Retries network errors, 5xx and 429 up to `attempts` in total; other 4xx fail at once."""
+    """Retries network errors, 5xx and 429 up to `attempts` in total; other 4xx fail at once.
+
+    `before_attempt` runs before every request, so a paid call reserves budget per attempt and
+    an exception there stops the call. `after_attempt` gets the response, or None when none
+    arrived (the server may still have processed the request).
+    """
     for attempt in range(1, attempts + 1):
         last = attempt == attempts
+        if before_attempt is not None:
+            await before_attempt()
         try:
             response = await client.request(method, url, params=params, json=json)
         except httpx.TransportError as exc:
+            if after_attempt is not None:
+                await after_attempt(None)
             logger.warning(
                 "http request failed",
                 extra={"operation": "http", "result": "retry", "error_code": type(exc).__name__},
@@ -46,6 +57,8 @@ async def send_with_retry(
             await sleep(float(2 ** (attempt - 1)))
             continue
 
+        if after_attempt is not None:
+            await after_attempt(response)
         status = response.status_code
         if status == 429:
             wait = _rate_limit_wait(response)

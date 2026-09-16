@@ -12,7 +12,16 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fakes import OWNER_ID, TIMEZONE, FakeGateway, Inbox, settings_for, snowflake
+from fakes import (
+    LLM_CALL_USD,
+    OWNER_ID,
+    TIMEZONE,
+    FakeGateway,
+    Inbox,
+    open_guard,
+    settings_for,
+    snowflake,
+)
 
 from qmemo_radar.bootstrap import Application, Services, build_services, build_x_collector
 from qmemo_radar.config import SourcesConfig
@@ -140,16 +149,21 @@ class Radar:
     def __init__(self, db: Path, x: FakeX, llm: FakeLlm) -> None:
         self.repository = SQLiteEventRepository(db)
         self.gateway = FakeGateway()
+        # The real SQLite cost ledger: every X and LLM call below is reserved before it is sent.
+        guard = open_guard(self.repository)
         x_client = XApiClient(
             httpx.AsyncClient(
                 base_url="https://api.x.com", transport=httpx.MockTransport(x.handler)
-            )
+            ),
+            guard=guard,
         )
         chat = ChatCompletionsClient(
             httpx.AsyncClient(
                 base_url="https://llm.test/v1", transport=httpx.MockTransport(llm.handler)
             ),
             model="e2e-model",
+            guard=guard,
+            cost_per_call_usd=LLM_CALL_USD,
             sleep=_no_sleep,
         )
         app = Application(settings=settings_for(self.repository), repository=self.repository)
@@ -260,6 +274,9 @@ async def test_full_path_from_x_to_outbox_survives_restart(tmp_path: Path) -> No
     ]
     assert await restarted.repository.count_packages(OutboxStatus.APPROVED) == 1
     assert restarted.rows("SELECT COUNT(*) FROM telegram_deliveries") == [(2,)]
+    # Every X page and LLM request went through the BudgetGuard ledger before it was sent.
+    ledger = dict(restarted.rows("SELECT provider, COUNT(*) FROM cost_ledger GROUP BY provider"))
+    assert ledger == {"x": len(x.requests) + 2, "llm.test": len(llm.requests)}
     statuses = await restarted.repository.count_by_status()
     assert statuses[EventStatus.APPROVED.value] == 1 and statuses[EventStatus.NOTIFIED.value] == 1
 

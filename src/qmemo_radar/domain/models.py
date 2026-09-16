@@ -1,4 +1,5 @@
 from datetime import datetime
+from decimal import Decimal
 from typing import Annotated
 from uuid import uuid4
 
@@ -71,6 +72,8 @@ class EventCandidate(RawSourceItem):
     normalized_text: str
     content_hash: str
     status: EventStatus = EventStatus.DISCOVERED
+    filter_reason: str | None = None
+    duplicate_of_event_id: str | None = None
 
 
 class ScoreBreakdown(DomainModel):
@@ -199,6 +202,16 @@ class PipelineRun(DomainModel):
     finished_at: datetime | None = None
     counters: PipelineCounters
     error_code: str | None = None
+
+
+class CostEntry(DomainModel):
+    """One potentially paid external operation, written before the request is sent."""
+
+    provider: str = Field(min_length=1, max_length=80)
+    operation: str = Field(min_length=1, max_length=80)
+    units: int = Field(ge=0)
+    estimated_cost_usd: Decimal = Field(ge=0)
+    created_at: datetime
 
 
 class SourceHealth(DomainModel):

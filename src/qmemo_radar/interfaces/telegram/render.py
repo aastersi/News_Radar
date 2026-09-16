@@ -263,16 +263,16 @@ def status_text(report: StatusReport, *, timezone: ZoneInfo) -> str:
     )
     failing = [source for source in report.sources if source.consecutive_failures]
     if not report.sources:
-        lines.append("X: источники ещё не опрашивались")
+        lines.append("Источники ещё не опрашивались")
     elif failing:
-        lines.append(f"X: ошибки в {len(failing)} из {len(report.sources)} источников")
+        lines.append(f"Источники: ошибки в {len(failing)} из {len(report.sources)}")
         lines += [
             f"• {esc(source.source_key)}: {esc(source.last_error)}"
             f" (подряд: {source.consecutive_failures})"
             for source in failing
         ]
     else:
-        lines.append(f"X: все источники в порядке ({len(report.sources)})")
+        lines.append(f"Источники: все в порядке ({len(report.sources)})")
     lines.append(f"LLM: {_llm_state(last.counters if last else None)}")
     today = report.today
     lines += [
