@@ -1,12 +1,29 @@
+# Скопируйте в sources.yaml. После изменений: docker compose restart radar
+#
+# Стоимость: X API оплачивается за использование, каждая полученная публикация — платное чтение.
+# Одна страница — до 100 публикаций; благодаря since_id следующие запуски получают только новые.
+
 x:
+  # Каждый включённый аккаунт — отдельный запрос "from:<handle> -is:retweet"
+  # со своим checkpoint (source_key account:<handle>).
   accounts:
     - handle: example_founder
       enabled: true
+
+  # Каждый включённый запрос имеет свой checkpoint (source_key query:<name>).
+  # Синтаксис: https://docs.x.com/x-api/posts/search/integrate/build-a-query (до 512 символов).
   queries:
     - name: crypto_predictions
-      query: '(crypto OR Solana) (predicts OR says OR promises) -is:retweet'
+      query: '(crypto OR Solana) (predicts OR says OR promises) lang:en -is:retweet'
       enabled: true
 
-blocked_authors: []
-blocked_terms: []
+  # Сколько страниц читать по каждому запросу за один сбор (1-10). Повышайте только для узких запросов.
+  max_pages_per_query: 1
 
+# Публикации этих авторов (handle или числовой id) всегда отбрасываются.
+blocked_authors: []
+
+# Публикации с этими словами или фразами (без учёта регистра) всегда отбрасываются.
+blocked_terms:
+  - giveaway
+  - airdrop

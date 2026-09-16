@@ -7,4 +7,10 @@ __pycache__
 .mypy_cache
 data
 tests
-
+.env
+.env.*
+!.env.example
+sources.yaml
+*.db
+*.db-shm
+*.db-wal

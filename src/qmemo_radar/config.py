@@ -1,7 +1,9 @@
+from datetime import time
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import Field, SecretStr, model_validator
+import yaml
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -13,12 +15,15 @@ class RadarSettings(BaseSettings):
         env_prefix="RADAR_",
         extra="ignore",
         case_sensitive=False,
+        # `RADAR_ALLOWED_TELEGRAM_ID=` copied from .env.example means "not set", not an error.
+        env_ignore_empty=True,
     )
 
     environment: str = "development"
     log_level: str = "INFO"
     timezone: str = "Asia/Ho_Chi_Minh"
     db_path: Path = Path("data/radar.db")
+    sources_path: Path = Path("sources.yaml")
 
     telegram_bot_token: SecretStr | None = None
     allowed_telegram_id: int | None = None
@@ -27,10 +32,13 @@ class RadarSettings(BaseSettings):
     llm_base_url: str | None = None
     llm_api_key: SecretStr | None = None
     llm_model: str | None = None
+    llm_temperature: float = Field(default=0.0, ge=0.0, le=1.0)
 
     collect_interval_minutes: int = Field(default=30, ge=5, le=1440)
     max_event_age_minutes: int = Field(default=60, ge=5, le=10080)
     daily_card_limit: int = Field(default=10, ge=1, le=50)
+    digest_card_limit: int = Field(default=5, ge=1, le=5)
+    digest_times: str = "10:00,15:00,20:00"
     urgent_threshold: int = Field(default=80, ge=0, le=100)
     digest_threshold: int = Field(default=65, ge=0, le=100)
     archive_threshold: int = Field(default=50, ge=0, le=100)
@@ -41,18 +49,97 @@ class RadarSettings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_thresholds_and_timezone(self) -> "RadarSettings":
-        if not (
-            self.archive_threshold <= self.digest_threshold <= self.urgent_threshold
-        ):
-            raise ValueError(
-                "Thresholds must satisfy archive <= digest <= urgent"
-            )
+        if not (self.archive_threshold <= self.digest_threshold <= self.urgent_threshold):
+            raise ValueError("Thresholds must satisfy archive <= digest <= urgent")
         try:
             ZoneInfo(self.timezone)
         except ZoneInfoNotFoundError as exc:
             raise ValueError(f"Unknown timezone: {self.timezone}") from exc
+        self.digest_schedule  # noqa: B018 - validates RADAR_DIGEST_TIMES early
         return self
+
+    @property
+    def zone(self) -> ZoneInfo:
+        return ZoneInfo(self.timezone)
+
+    @property
+    def digest_schedule(self) -> tuple[time, ...]:
+        try:
+            times = tuple(
+                sorted({time.fromisoformat(v.strip()) for v in self.digest_times.split(",")})
+            )
+        except ValueError as exc:
+            raise ValueError("RADAR_DIGEST_TIMES must look like 10:00,15:00,20:00") from exc
+        if not 2 <= len(times) <= 3:
+            raise ValueError("RADAR_DIGEST_TIMES must contain two or three different times")
+        return times
+
+    def production_problems(self) -> list[str]:
+        """What prevents `qmemo-radar run`. Empty means the configuration is complete."""
+        required = {
+            "RADAR_TELEGRAM_BOT_TOKEN": self.telegram_bot_token,
+            "RADAR_ALLOWED_TELEGRAM_ID": self.allowed_telegram_id,
+            "RADAR_X_BEARER_TOKEN": self.x_bearer_token,
+            "RADAR_LLM_BASE_URL": self.llm_base_url,
+            "RADAR_LLM_API_KEY": self.llm_api_key,
+            "RADAR_LLM_MODEL": self.llm_model,
+        }
+        problems = [f"{name} is required" for name, value in required.items() if not value]
+        # No real publisher exists yet, so enabling publishing must stop the service.
+        if self.qmemo_publishing_enabled:
+            problems.append("RADAR_QMEMO_PUBLISHING_ENABLED must stay false in this version")
+        if self.x_publishing_enabled:
+            problems.append("RADAR_X_PUBLISHING_ENABLED must stay false in this version")
+        if not self.sources_path.is_file():
+            problems.append(f"sources file not found: {self.sources_path}")
+        return problems
+
+    def secret_values(self) -> list[str]:
+        secrets = (self.telegram_bot_token, self.x_bearer_token, self.llm_api_key)
+        return [secret.get_secret_value() for secret in secrets if secret]
 
     def ensure_data_directory(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
+
+class _SourcesModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class XAccountSource(_SourcesModel):
+    handle: str = Field(pattern=r"^[A-Za-z0-9_]{1,15}$")
+    enabled: bool = True
+
+
+class XQuerySource(_SourcesModel):
+    name: str = Field(pattern=r"^[a-z0-9_]{1,40}$")
+    # Self-serve X API access allows recent-search queries of up to 512 characters.
+    query: str = Field(min_length=1, max_length=512)
+    enabled: bool = True
+
+
+class XSources(_SourcesModel):
+    accounts: tuple[XAccountSource, ...] = ()
+    queries: tuple[XQuerySource, ...] = ()
+    # Each page can return up to 100 billed post reads, so one page is the safe default.
+    max_pages_per_query: int = Field(default=1, ge=1, le=10)
+
+
+class SourcesConfig(_SourcesModel):
+    """Contents of sources.yaml: what to read from X and what to always drop."""
+
+    x: XSources = XSources()
+    blocked_authors: tuple[str, ...] = ()
+    blocked_terms: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_unique_keys(self) -> "SourcesConfig":
+        handles = [account.handle.casefold() for account in self.x.accounts]
+        names = [query.name for query in self.x.queries]
+        if len(handles) != len(set(handles)) or len(names) != len(set(names)):
+            raise ValueError("Account handles and query names in sources.yaml must be unique")
+        return self
+
+
+def load_sources(path: Path) -> SourcesConfig:
+    return SourcesConfig.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")) or {})

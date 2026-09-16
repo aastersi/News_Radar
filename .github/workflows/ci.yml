@@ -18,7 +18,7 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install --upgrade pip
-      - run: python -m pip install -e ".[dev]"
+      - run: python -m pip install -e ".[dev,telegram]"
       - run: ruff check .
       - run: mypy src
       - run: pytest

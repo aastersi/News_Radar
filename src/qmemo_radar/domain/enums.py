@@ -35,3 +35,34 @@ class FactCheckStatus(StrEnum):
     VERIFIED = "VERIFIED"
     NEEDS_REVIEW = "NEEDS_REVIEW"
 
+
+
+class DeliveryKind(StrEnum):
+    DIGEST = "digest"
+    URGENT = "urgent"
+
+
+class FeedbackAction(StrEnum):
+    USE = "USE"
+    SKIP = "SKIP"
+    LATER = "LATER"
+    REVISE_SHORTER = "REVISE_SHORTER"
+    REVISE_ANGLE = "REVISE_ANGLE"
+    REVISE_CUSTOM = "REVISE_CUSTOM"
+    VERIFY = "VERIFY"
+    ACCEPT = "ACCEPT"
+    REJECT = "REJECT"
+
+
+class RunStatus(StrEnum):
+    RUNNING = "RUNNING"
+    SUCCESS = "SUCCESS"
+    PARTIAL = "PARTIAL"
+    FAILED = "FAILED"
+
+
+class DraftStatus(StrEnum):
+    ACTIVE = "ACTIVE"
+    SUPERSEDED = "SUPERSEDED"
+    ACCEPTED = "ACCEPTED"
+    REJECTED = "REJECTED"

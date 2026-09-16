@@ -1,24 +1,38 @@
 import argparse
 import asyncio
+import itertools
 import json
-from datetime import UTC, datetime
+import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import NoReturn
 
 from pydantic import HttpUrl
 
-from qmemo_radar.bootstrap import build_application, build_pipeline
-from qmemo_radar.config import RadarSettings
-from qmemo_radar.domain import Engagement, RawSourceItem, SourceType
+from qmemo_radar.application.runner import HEARTBEAT_KEY
+from qmemo_radar.bootstrap import build_application, build_services
+from qmemo_radar.config import RadarSettings, SourcesConfig, load_sources
+from qmemo_radar.domain import (
+    Engagement,
+    FactCheckStatus,
+    OutboxStatus,
+    RawSourceItem,
+    ScoredEvent,
+    SourceType,
+)
 from qmemo_radar.infrastructure.collectors import FakeCollector
+from qmemo_radar.infrastructure.drafting import DeterministicDraftWriter
 from qmemo_radar.infrastructure.ranking import DeterministicFixtureRanker
+from qmemo_radar.infrastructure.storage import SQLiteEventRepository
+
+HEARTBEAT_MAX_AGE = timedelta(minutes=3)
+DRY_RUN_USER_ID = 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="qmemo-radar")
     parser.add_argument(
         "command",
-        choices=("init-db", "status", "dry-run", "run"),
+        choices=("init-db", "status", "dry-run", "run", "healthcheck", "check-config"),
     )
     parser.add_argument("--db", type=Path, help="Override SQLite path")
     return parser
@@ -26,6 +40,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 async def execute(command: str, *, db_path: Path | None = None) -> int:
     settings = RadarSettings(db_path=db_path) if db_path else RadarSettings()
+
+    if command == "run":
+        from qmemo_radar.interfaces.runtime import run_production
+
+        return await run_production(settings)
+
+    if command == "check-config":
+        return _check_config(settings)
+
+    if command == "healthcheck":
+        return await _healthcheck(settings)
+
     app = build_application(settings)
 
     if command == "init-db":
@@ -42,6 +68,7 @@ async def execute(command: str, *, db_path: Path | None = None) -> int:
                     "status": "ok",
                     "database": str(settings.db_path),
                     "events": counts,
+                    "outbox_approved": await app.repository.count_packages(OutboxStatus.APPROVED),
                     "qmemo_publishing": settings.qmemo_publishing_enabled,
                     "x_publishing": settings.x_publishing_enabled,
                 },
@@ -51,42 +78,133 @@ async def execute(command: str, *, db_path: Path | None = None) -> int:
         return 0
 
     if command == "dry-run":
-        await app.repository.initialize()
-        collector = FakeCollector([_sample_item()])
-        pipeline = build_pipeline(
-            app,
-            collector=collector,
-            ranker=DeterministicFixtureRanker(),
-        )
-        counters = await pipeline.run_once()
-        print(counters.model_dump_json())
-        return 0
-
-    if command == "run":
-        return _production_not_ready()
+        return await _dry_run(settings)
 
     raise AssertionError(f"Unknown command: {command}")
 
 
-def _sample_item() -> RawSourceItem:
-    return RawSourceItem(
-        source=SourceType.X,
-        external_id="dry-run-1",
-        url=HttpUrl("https://x.com/example/status/dry-run-1?utm_source=test"),
-        author_handle="example",
-        author_display_name="Example Founder",
-        original_text='Founder said: "Predictions should be remembered, not rewritten."',
-        language="en",
-        published_at=datetime.now(UTC),
-        engagement=Engagement(likes=120, reposts=15, replies=40, quotes=8),
+async def _dry_run(settings: RadarSettings) -> int:
+    """Offline path: fixtures -> filter -> rank -> SQLite -> cards -> draft -> outbox."""
+    app = build_application(settings)
+    await app.repository.initialize()
+    gateway = _OfflineGateway()
+    services = build_services(
+        app,
+        collector=FakeCollector(_sample_items()),
+        ranker=DeterministicFixtureRanker(),
+        writer=DeterministicDraftWriter(),
+        gateway=gateway,
+        lookup=None,
+        sources=SourcesConfig(),
     )
+    cycle = await services.runner.run_cycle(manual=True)
+    digest_sent = await services.review.deliver(urgent=False)
+
+    draft_id = package_id = None
+    if gateway.cards:
+        used = await services.drafts.use(gateway.cards[0].event.event_id, DRY_RUN_USER_ID)
+        if used.draft is not None:
+            draft_id = used.draft.draft_id
+            if used.draft.fact_check_status is FactCheckStatus.NEEDS_REVIEW:
+                await services.drafts.verify(draft_id, DRY_RUN_USER_ID)
+            accepted = await services.drafts.accept(draft_id, DRY_RUN_USER_ID)
+            package_id = accepted.package.package_id if accepted.package else None
+
+    print(
+        json.dumps(
+            {
+                "run_status": cycle.status,
+                "counters": cycle.counters.model_dump() if cycle.counters else None,
+                "cards_sent": {"urgent": cycle.urgent_sent, "digest": digest_sent},
+                "draft_id": draft_id,
+                "package_id": package_id,
+                "outbox_approved": await app.repository.count_packages(OutboxStatus.APPROVED),
+                "qmemo_publishing": settings.qmemo_publishing_enabled,
+                "x_publishing": settings.x_publishing_enabled,
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
 
 
-def _production_not_ready() -> NoReturn:
-    raise SystemExit(
-        "Production run is fail-closed until X, LLM and Telegram adapters are configured. "
-        "Use dry-run to verify the foundation."
-    )
+def _check_config(settings: RadarSettings) -> int:
+    problems = settings.production_problems()
+    summary: dict[str, object] = {"problems": problems}
+    if settings.sources_path.is_file():
+        try:
+            sources = load_sources(settings.sources_path)
+        except Exception as exc:
+            problems.append(f"sources file is invalid: {str(exc)[:300]}")
+        else:
+            summary["x_accounts"] = sum(item.enabled for item in sources.x.accounts)
+            summary["x_queries"] = sum(item.enabled for item in sources.x.queries)
+    summary["status"] = "ok" if not problems else "invalid"
+    summary["digest_times"] = [moment.strftime("%H:%M") for moment in settings.digest_schedule]
+    print(json.dumps(summary, ensure_ascii=False))
+    return 0 if not problems else 78
+
+
+async def _healthcheck(settings: RadarSettings) -> int:
+    """Healthy when the scheduler heartbeat in SQLite is recent. Never creates the database."""
+    heartbeat = None
+    if settings.db_path.is_file():
+        heartbeat = await SQLiteEventRepository(settings.db_path).get_state(HEARTBEAT_KEY)
+    age = datetime.now(UTC) - datetime.fromisoformat(heartbeat) if heartbeat else None
+    healthy = age is not None and age < HEARTBEAT_MAX_AGE
+    print(json.dumps({"healthy": healthy, "heartbeat_age_seconds": age and age.total_seconds()}))
+    return 0 if healthy else 1
+
+
+class _OfflineGateway:
+    """Dry-run stand-in for Telegram: keeps cards in memory and sends nothing."""
+
+    _message_ids = itertools.count(time.time_ns() // 1_000_000)
+
+    def __init__(self) -> None:
+        self.cards: list[ScoredEvent] = []
+
+    async def send_card(self, card: ScoredEvent, *, urgent: bool) -> int:
+        self.cards.append(card)
+        return next(self._message_ids)
+
+
+def _sample_items() -> list[RawSourceItem]:
+    now = datetime.now(UTC)
+    return [
+        RawSourceItem(
+            source=SourceType.X,
+            external_id="dry-run-1",
+            url=HttpUrl("https://x.com/example/status/1?utm_source=test"),
+            author_handle="example",
+            author_display_name="Example Founder",
+            original_text='Founder said: "Predictions should be remembered, not rewritten."',
+            language="en",
+            published_at=now,
+            engagement=Engagement(likes=120, reposts=15, replies=40, quotes=8),
+            source_key="dry-run",
+        ),
+        RawSourceItem(
+            source=SourceType.X,
+            external_id="dry-run-2",
+            url=HttpUrl("https://x.com/example/status/2"),
+            author_handle="example",
+            original_text="A long thread about the roadmap for the next product release cycle.",
+            language="en",
+            published_at=now - timedelta(minutes=10),
+            source_key="dry-run",
+        ),
+        RawSourceItem(
+            source=SourceType.X,
+            external_id="dry-run-3",
+            url=HttpUrl("https://x.com/example/status/3"),
+            author_handle="example",
+            original_text='Founder said: "This old statement is outside the collection window."',
+            language="en",
+            published_at=now - timedelta(hours=3),
+            source_key="dry-run",
+        ),
+    ]
 
 
 def main() -> None:

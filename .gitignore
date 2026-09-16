@@ -13,3 +13,7 @@ build/
 data/
 logs/
 
+sources.yaml
+*.db
+*.db-shm
+*.db-wal

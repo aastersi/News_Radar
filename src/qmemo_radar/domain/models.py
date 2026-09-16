@@ -1,14 +1,32 @@
 from datetime import datetime
+from typing import Annotated
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, HttpUrl, model_validator
 
 from qmemo_radar.domain.enums import (
+    DraftStatus,
     EventStatus,
     FactCheckStatus,
     OutboxStatus,
+    RunStatus,
     SourceType,
 )
+
+QMEMO_URL_PLACEHOLDER = "{qmemo_url}"
+X_POST_LIMIT = 280
+X_LINK_LENGTH = 23  # every link counts as 23 characters on X
+
+
+def _x_text_template(value: str) -> str:
+    if value.count(QMEMO_URL_PLACEHOLDER) != 1:
+        raise ValueError("x_text_template must contain {qmemo_url} exactly once")
+    if len(value.replace(QMEMO_URL_PLACEHOLDER, "x" * X_LINK_LENGTH)) > X_POST_LIMIT:
+        raise ValueError("x_text_template must fit 280 characters including the link")
+    return value
+
+
+XTextTemplate = Annotated[str, AfterValidator(_x_text_template)]
 
 
 class DomainModel(BaseModel):
@@ -35,6 +53,16 @@ class RawSourceItem(DomainModel):
     published_at: datetime
     engagement: Engagement = Field(default_factory=Engagement)
     raw_payload: dict[str, object] = Field(default_factory=dict)
+    source_key: str | None = Field(default=None, max_length=80)
+
+
+class SourceFetch(DomainModel):
+    """One configured source query. Its cursor is saved only after all items are stored."""
+
+    source_key: str = Field(min_length=1, max_length=80)
+    items: tuple[RawSourceItem, ...] = ()
+    cursor: str | None = None
+    error_code: str | None = None
 
 
 class EventCandidate(RawSourceItem):
@@ -66,6 +94,8 @@ class ScoreResult(DomainModel):
     fact_check_note: str | None = None
     prompt_version: str = "deterministic-v1"
     model_name: str = "none"
+    headline: str = Field(default="", max_length=160)
+    summary: str = Field(default="", max_length=600)
 
 
 class PublicationPackage(DomainModel):
@@ -83,7 +113,7 @@ class PublicationPackage(DomainModel):
     source_external_id: str
     source_url: HttpUrl
     source_published_at: datetime
-    x_text_template: str
+    x_text_template: XTextTemplate
     x_text_short: str
     cta: str
     fact_check_status: FactCheckStatus
@@ -92,6 +122,12 @@ class PublicationPackage(DomainModel):
     approved_at: datetime
     idempotency_key: str
     status: OutboxStatus = OutboxStatus.APPROVED
+
+    @model_validator(mode="after")
+    def require_verified_facts(self) -> "PublicationPackage":
+        if self.fact_check_status is not FactCheckStatus.VERIFIED:
+            raise ValueError("A publication package requires fact_check_status=VERIFIED")
+        return self
 
 
 class PipelineCounters(BaseModel):
@@ -104,4 +140,70 @@ class PipelineCounters(BaseModel):
     scored: int = 0
     shortlisted: int = 0
     archived: int = 0
+    source_errors: int = 0
+    rank_failed: int = 0
 
+
+class ScoredEvent(DomainModel):
+    event: EventCandidate
+    score: ScoreResult
+
+
+class DraftText(DomainModel):
+    """What a draft writer produces for one event. Checked against the source before use."""
+
+    quote_text: str = Field(min_length=3, max_length=500)
+    quote_speaker: str | None = Field(default=None, max_length=120)
+    context_summary: str = Field(min_length=1, max_length=400)
+    qmemo_text: str = Field(min_length=1, max_length=600)
+    x_text_template: XTextTemplate
+    x_text_short: str = Field(min_length=1, max_length=160)
+    angle: str = Field(min_length=1, max_length=150)
+    cta: str = Field(min_length=1, max_length=120)
+    fact_check_required: bool
+    fact_check_notes: tuple[Annotated[str, Field(max_length=200)], ...] = Field(
+        default=(), max_length=3
+    )
+    prompt_version: str = "deterministic-v1"
+    model_name: str = "none"
+
+
+class Draft(DomainModel):
+    """One immutable draft version; at most two versions exist per event."""
+
+    draft_id: str = Field(default_factory=lambda: uuid4().hex)
+    event_id: str
+    version: int = Field(ge=1, le=2)
+    quote_text: str = Field(min_length=3)
+    quote_author: str = Field(min_length=1)
+    quote_language: str = Field(min_length=1)
+    context_summary: str
+    qmemo_text: str
+    x_text_template: XTextTemplate
+    x_text_short: str
+    angle: str
+    cta: str
+    fact_check_status: FactCheckStatus
+    fact_check_notes: tuple[str, ...] = ()
+    status: DraftStatus = DraftStatus.ACTIVE
+    prompt_version: str
+    model_name: str
+    revision_instruction: str | None = None
+    created_at: datetime
+
+
+class PipelineRun(DomainModel):
+    run_id: str
+    status: RunStatus
+    started_at: datetime
+    finished_at: datetime | None = None
+    counters: PipelineCounters
+    error_code: str | None = None
+
+
+class SourceHealth(DomainModel):
+    source_key: str
+    last_success_at: datetime | None = None
+    last_error_at: datetime | None = None
+    last_error: str | None = None
+    consecutive_failures: int = 0
