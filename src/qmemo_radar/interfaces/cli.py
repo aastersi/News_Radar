@@ -152,7 +152,9 @@ async def _healthcheck(settings: RadarSettings) -> int:
         heartbeat = await SQLiteEventRepository(settings.db_path).get_state(HEARTBEAT_KEY)
     age = datetime.now(UTC) - datetime.fromisoformat(heartbeat) if heartbeat else None
     healthy = age is not None and age < HEARTBEAT_MAX_AGE
-    print(json.dumps({"healthy": healthy, "heartbeat_age_seconds": age and age.total_seconds()}))
+    # `is not None`: a zero timedelta is falsy, and the heartbeat may be written this instant.
+    seconds = age.total_seconds() if age is not None else None
+    print(json.dumps({"healthy": healthy, "heartbeat_age_seconds": seconds}))
     return 0 if healthy else 1
 
 
