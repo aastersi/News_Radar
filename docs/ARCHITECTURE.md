@@ -84,7 +84,7 @@ src/qmemo_radar/
     ranking.py            LlmRanker и офлайн-ранжировщик
     drafting.py           LlmDraftWriter и офлайн-писатель
     collectors/x_api.py   XApiClient и XRecentSearchCollector
-    storage/              SQLite и миграции 001-007
+    storage/              SQLite и миграции 001-008
     publishing/           только выключенные publishers
   interfaces/
     cli.py                команды

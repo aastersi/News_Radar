@@ -48,6 +48,8 @@ if TYPE_CHECKING:
 
     from qmemo_radar.interfaces.telegram.controller import TelegramController
 
+logger = logging.getLogger(__name__)
+
 _LOG_FIELDS = ("run_id", "event_id", "source_key", "operation", "result", "error_code")
 
 
@@ -251,9 +253,20 @@ async def build_runtime(settings: RadarSettings, sources: SourcesConfig) -> Asyn
         bot = build_bot(settings.telegram_bot_token.get_secret_value())
         stack.push_async_callback(bot.session.close)
 
+        collector = build_collector(SourceContext(settings, sources, x_client))
+        # An upgrade from the X pilot without the new paid flags would otherwise run silently idle.
+        logger.log(
+            logging.INFO if collector.names and llm else logging.WARNING,
+            "radar capabilities",
+            extra={
+                "operation": "startup",
+                "result": f"sources={','.join(collector.names) or 'none'} "
+                f"ranking={'llm' if llm else 'off'} x_lookup={'on' if x_client else 'off'}",
+            },
+        )
         services = build_services(
             application,
-            collector=build_collector(SourceContext(settings, sources, x_client)),
+            collector=collector,
             ranker=LlmRanker(llm) if llm else None,
             writer=LlmDraftWriter(llm) if llm else DisabledDraftWriter(),
             gateway=TelegramReviewGateway(

@@ -1,4 +1,5 @@
 import sqlite3
+import time
 from datetime import UTC, datetime, timedelta
 
 from fakes import x_item
@@ -43,3 +44,40 @@ async def test_only_untouched_noise_is_prunable(repository: SQLiteEventRepositor
     later = datetime.now(UTC) + timedelta(days=1)
     assert await repository.count_prunable_noise(later) == {"FILTERED_OUT": 2, "ARCHIVED": 1}
     assert await repository.count_prunable_noise(datetime.now(UTC) - timedelta(days=14)) == {}
+
+
+async def test_prunable_count_stays_fast_on_a_large_table(
+    repository: SQLiteEventRepository,
+) -> None:
+    rows = [
+        (
+            f"e{n}",
+            "rss",
+            str(n),
+            f"https://news.example/{n}",
+            "noise",
+            "noise",
+            f"h{n}",
+            "2026-01-01T00:00:00+00:00",
+            "2026-01-01T00:00:00+00:00",
+            "FILTERED_OUT",
+            "2026-01-01",
+            "2026-01-01",
+            f"e{n - 1}" if n % 10 == 0 else None,  # every tenth row is a copy of the previous one
+        )
+        for n in range(1, 30_001)
+    ]
+    with sqlite3.connect(repository._db_path) as db:
+        db.executemany(
+            "INSERT INTO radar_events (id, source, external_id, url, original_text, "
+            "normalized_text, content_hash, published_at, discovered_at, status, created_at, "
+            "updated_at, duplicate_of_event_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            rows,
+        )
+
+    started = time.perf_counter()
+    counts = await repository.count_prunable_noise(datetime(2026, 2, 1, tzinfo=UTC))
+    elapsed = time.perf_counter() - started
+
+    assert counts == {"FILTERED_OUT": 27_000}  # the 3,000 originals of copies are kept
+    assert elapsed < 5  # without the 008 indexes this took minutes (a scan per candidate)

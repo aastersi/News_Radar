@@ -11,6 +11,7 @@ import pytest
 from qmemo_radar.application.budget import BudgetGuard, PaidFeature
 from qmemo_radar.application.collection import MultiSourceCollector
 from qmemo_radar.application.filtering import FilterPolicy
+from qmemo_radar.application.normalization import build_candidate
 from qmemo_radar.application.pipeline import PipelineThresholds, RadarPipeline
 from qmemo_radar.application.ports import SourceCollector
 from qmemo_radar.bootstrap import (
@@ -156,6 +157,9 @@ async def test_free_collector_keeps_working_when_the_budget_is_exhausted(
         "account:founder": "hard_limit_reached",
         "query:q": "hard_limit_reached",
         "rss:wire": None,
+        # Each collector that ran without crashing also reports itself healthy.
+        "rss": None,
+        "x_search": None,
     }
 
 
@@ -224,3 +228,43 @@ async def test_ingestion_metrics_per_source(
         if record.getMessage() == "source collected"
     }
     assert logged["rss:wire"] == "collected=6 exact_duplicates=6"
+
+
+async def test_collector_recovering_from_a_crash_clears_its_error(
+    repository: SQLiteEventRepository,
+) -> None:
+    class Flaky:
+        crash = True
+
+        async def collect(self, checkpoints: Mapping[str, str]) -> list[SourceFetch]:
+            if self.crash:
+                raise RuntimeError("temporary")
+            return []
+
+    flaky = Flaky()
+    collector = MultiSourceCollector({"flaky": flaky})
+    await pipeline(collector, repository).run_once()
+    flaky.crash = False
+    await pipeline(collector, repository).run_once()
+
+    [health] = await repository.source_health()
+    assert (health.source_key, health.consecutive_failures) == ("flaky", 0)
+
+
+async def test_copy_of_an_ignored_original_is_stored_without_a_dangling_link(
+    repository: SQLiteEventRepository,
+) -> None:
+    stored = build_candidate(article(SourceType.RSS, 1))
+    assert await repository.add_event(stored)  # e.g. a manual link stored between two awaits
+    # The ingest batch still believes its own copy of item 1 is the original.
+    original = build_candidate(article(SourceType.RSS, 1))
+    copy = build_candidate(article(SourceType.GDELT, 2)).model_copy(
+        update={"duplicate_of_event_id": original.event_id}
+    )
+
+    assert await repository.add_events([original, copy]) == 1
+    with sqlite3.connect(repository._db_path) as db:
+        rows = db.execute(
+            "SELECT id, external_id, duplicate_of_event_id FROM radar_events ORDER BY rowid"
+        ).fetchall()
+    assert rows == [(stored.event_id, "rss-1", None), (copy.event_id, "gdelt-2", None)]

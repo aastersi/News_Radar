@@ -41,4 +41,7 @@ class MultiSourceCollector:
                 fetches.append(SourceFetch(source_key=name, error_code=code))
             else:
                 fetches.extend(result)
+                if all(fetch.source_key != name for fetch in result):
+                    # Marks the collector itself healthy, clearing an earlier crash in /status.
+                    fetches.append(SourceFetch(source_key=name))
         return fetches

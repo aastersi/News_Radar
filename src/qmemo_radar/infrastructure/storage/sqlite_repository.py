@@ -45,7 +45,12 @@ _INSERT_EVENT = """
         content_hash, language, published_at, discovered_at,
         engagement_json, raw_payload_json, status, created_at, updated_at,
         source_key, filter_reason, duplicate_of_event_id
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+        -- NULL instead of a foreign-key error when the original was ignored as a duplicate
+        -- (e.g. a manual link stored it between find_known and this insert).
+        (SELECT id FROM radar_events WHERE id = ?)
+    )
 """
 # Retention candidates; everything a person touched is kept regardless of status.
 _NOISE = (EventStatus.FILTERED_OUT, EventStatus.EXPIRED, EventStatus.ARCHIVED)
