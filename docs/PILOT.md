@@ -7,7 +7,8 @@
 - [ ] Создан отдельный бот в @BotFather, токен в `RADAR_TELEGRAM_BOT_TOKEN`.
 - [ ] Свой Telegram ID в `RADAR_ALLOWED_TELEGRAM_ID`.
 - [ ] В console.x.com создано приложение, пополнены кредиты, Bearer Token в `RADAR_X_BEARER_TOKEN`.
-- [ ] LLM: `RADAR_LLM_BASE_URL`, `RADAR_LLM_API_KEY`, `RADAR_LLM_MODEL`.
+- [ ] LLM: `RADAR_LLM_BASE_URL`, `RADAR_LLM_API_KEY`, `RADAR_LLM_MODEL`, оценка `RADAR_LLM_COST_PER_CALL_USD`.
+- [ ] Пилот X платный: `RADAR_PAID_SOURCES_ENABLED=true`, `RADAR_X_PAID_SEARCH_ENABLED=true`, `RADAR_PAID_LLM_ENABLED=true`. Все платные вызовы вместе не превысят `RADAR_COST_HARD_LIMIT_USD_MONTHLY` (не больше $10); расход виден в `qmemo-radar status` → `cost_month_usd`.
 - [ ] `sources.yaml`: 5-15 аккаунтов и 2-5 узких запросов, `max_pages_per_query: 1`.
 - [ ] `RADAR_DIGEST_TIMES` совпадает с удобными вам часами.
 - [ ] Обе переменные публикации равны `false`.
