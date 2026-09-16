@@ -32,6 +32,7 @@ from qmemo_radar.application.scheduler import RadarScheduler
 from qmemo_radar.config import RadarSettings, SourcesConfig
 from qmemo_radar.exceptions import ProductionAdapterNotConfigured
 from qmemo_radar.infrastructure.collectors.gdelt_gqg import GdeltQuotationCollector
+from qmemo_radar.infrastructure.collectors.rss import Feed, RssCollector
 from qmemo_radar.infrastructure.collectors.x_api import (
     X_API_BASE_URL,
     XApiClient,
@@ -216,10 +217,22 @@ def _build_gdelt(context: SourceContext) -> SourceCollector:
     )
 
 
+def _rss_enabled(_: RadarSettings, sources: SourcesConfig) -> bool:
+    return any(feed.enabled for feed in sources.rss.feeds)
+
+
+def _build_rss(context: SourceContext) -> SourceCollector:
+    feeds = [Feed(item.name, str(item.url)) for item in context.sources.rss.feeds if item.enabled]
+    return RssCollector(
+        _free_http(context), feeds, max_bytes=context.settings.rss_max_response_bytes
+    )
+
+
 # One entry per source type. A disabled entry is never built, so it needs no credentials.
 SOURCE_REGISTRY: tuple[SourceRegistration, ...] = (
     SourceRegistration("x_search", _x_search_enabled, _build_x_search),
     SourceRegistration("gdelt_gqg", lambda settings, _: settings.gdelt_enabled, _build_gdelt),
+    SourceRegistration("rss", _rss_enabled, _build_rss),
 )
 
 
