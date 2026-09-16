@@ -440,3 +440,62 @@ async def test_free_sources_alone_never_touch_the_cost_ledger(
 
     assert collector.names == ["gdelt_gqg", "rss"]
     assert await repository.cost_since(month_start(datetime.now(UTC))) == Decimal(0)
+
+
+async def test_a_free_source_backlog_does_not_starve_fresh_candidates(
+    repository: SQLiteEventRepository,
+) -> None:
+    # Regression: only the 100 oldest DISCOVERED events were re-checked and ranked, so a GDELT
+    # backlog of thousands kept every new item from reaching the ranker.
+    from qmemo_radar.exceptions import RankingFailed
+
+    earlier = datetime.now(UTC) - timedelta(hours=5)
+    backlog = [
+        build_candidate(article(SourceType.GDELT, n), discovered_at=earlier) for n in range(150)
+    ]
+    assert await repository.add_events(backlog) == 150
+    seen: list[str] = []
+
+    class Recording:
+        async def rank(self, events: object) -> list[object]:
+            seen.extend(event.external_id for event in events)  # type: ignore[attr-defined]
+            raise RankingFailed("provider_down", retryable=True)
+
+    fresh = Feed("rss:wire", [article(SourceType.RSS, 1)])
+    radar = pipeline(MultiSourceCollector({"rss": fresh}), repository)
+    radar._ranker = Recording()  # type: ignore[assignment]
+
+    await radar.run_once()
+
+    assert seen[0] == "rss-1"
+
+
+async def test_url_duplicate_lookup_uses_the_partial_index(
+    repository: SQLiteEventRepository,
+) -> None:
+    statements: list[str] = []
+    events = [build_candidate(article(SourceType.RSS, 1))]
+    original = repository._connect
+
+    def tracing() -> object:
+        context = original()
+
+        class Traced:
+            async def __aenter__(self) -> object:
+                db = await context.__aenter__()
+                await db.set_trace_callback(statements.append)
+                return db
+
+            async def __aexit__(self, *exc: object) -> None:
+                await context.__aexit__(*exc)
+
+        return Traced()
+
+    repository._connect = tracing  # type: ignore[method-assign]
+    await repository.find_known(events)
+    repository._connect = original  # type: ignore[method-assign]
+
+    [lookup] = [sql for sql in statements if "url IN" in sql]
+    with sqlite3.connect(repository._db_path) as db:
+        plan = " ".join(str(row[-1]) for row in db.execute(f"EXPLAIN QUERY PLAN {lookup}"))
+    assert "idx_events_source_url" in plan

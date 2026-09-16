@@ -118,7 +118,8 @@ class SQLiteEventRepository:
                     continue  # not a duplicate key, and the URL index does not cover this source
                 group_urls = [str(event.url) for event in group]
                 rows = await db.execute_fetchall(
-                    f"SELECT url FROM radar_events WHERE source = ? "
+                    # `source != 'gdelt'` lets SQLite use the partial index idx_events_source_url.
+                    f"SELECT url FROM radar_events WHERE source = ? AND source != 'gdelt' "
                     f"AND url IN ({_placeholders(group_urls)})",
                     (source, *group_urls),
                 )
@@ -235,7 +236,9 @@ class SQLiteEventRepository:
                 """
                 SELECT * FROM radar_events
                 WHERE status = ?
-                ORDER BY discovered_at ASC
+                -- Newest first: a large free-source backlog must not starve fresh candidates;
+                -- older ones expire by TTL.
+                ORDER BY discovered_at DESC
                 LIMIT ?
                 """,
                 (status.value, limit),
