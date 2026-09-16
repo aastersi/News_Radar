@@ -411,3 +411,74 @@ async def test_poison_rows_are_skipped_and_never_stall_the_cursor(
     assert metrics["malformed_rows"] == 2  # the deep row, once per run
     assert metrics["quotes_rejected"] == 2  # the surrogate quote, once per run
     assert metrics["invalid_items"] == 2  # the surrogate title reaches the pipeline and stops there
+
+
+async def test_a_cursor_or_clock_ahead_of_gdelt_is_an_error_not_a_gap(
+    repository: SQLiteEventRepository,
+) -> None:
+    # Regression: a future cursor idled while /status looked healthy, and a fast local clock
+    # recorded not-yet-published minutes as gaps, losing those files for good.
+    gdelt = Gdelt({})
+    await repository.record_source_result(SOURCE_KEY, cursor="20270101000000", error_code=None)
+    ahead = await pipeline(gdelt.collector(), repository).run_once()
+    assert (ahead.source_errors, gdelt.requested) == (1, [])
+    health = {h.source_key: h for h in await repository.source_health()}
+    assert health[SOURCE_KEY].last_error == "gdelt_cursor_ahead"
+
+    def dated(moment: datetime) -> Gdelt:
+        header = {"Date": moment.strftime("%a, %d %b %Y %H:%M:%S GMT")}
+        minutes = [f"{h}:{m:02d}" for h in (11, 12) for m in range(60)]
+        missing = lambda: httpx.Response(404, headers=header)  # noqa: E731
+        return Gdelt({minute(hhmm): missing for hhmm in minutes})
+
+    late = dated(NOW - timedelta(minutes=30))  # GDELT's clock: 12:00:30
+    await repository.record_source_result(SOURCE_KEY, cursor=minute("11:50"), error_code=None)
+    skewed = await pipeline(late.collector(), repository).run_once()
+    assert skewed.source_errors == 1
+    # By GDELT's clock only 11:50 and 11:51 are past the lag (plus one minute of tolerance).
+    assert await repository.get_checkpoints() == {SOURCE_KEY: minute("11:52")}
+    health = {h.source_key: h for h in await repository.source_health()}
+    assert health[SOURCE_KEY].last_error == "gdelt_clock_ahead"
+
+    synced = dated(NOW)
+    await pipeline(synced.collector(), repository).run_once()
+    assert await repository.get_checkpoints() == {SOURCE_KEY: minute("12:21")}
+
+
+async def test_a_cursor_with_seconds_is_floored_to_its_minute() -> None:
+    gdelt = Gdelt({})
+    await gdelt.collector().collect({SOURCE_KEY: "20260916121530"})
+    assert gdelt.requested[0] == minute("12:15")
+
+
+async def test_skipping_an_oversized_line_stops_at_the_decompression_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression: the skip loop decompressed a 1 GiB single-line bomb completely first.
+    body = gzip.compress(b"z" * (64 * 1024 * 1024))
+    reads = 0
+    original = gzip.GzipFile.readline
+
+    def counting(self: gzip.GzipFile, size: int = -1) -> bytes:
+        nonlocal reads
+        reads += 1
+        return original(self, size)
+
+    monkeypatch.setattr(gzip.GzipFile, "readline", counting)
+    monkeypatch.setattr(gdelt_gqg, "MAX_LINE_BYTES", 64 * 1024)
+    monkeypatch.setattr(gdelt_gqg, "MAX_DECOMPRESSED_BYTES", 1024 * 1024)
+    [found, final] = await Gdelt({minute("12:05"): body}).collector().collect({})
+    assert final.stats["files_truncated"] == 1 and found.items == ()
+    assert reads < 40  # ~1 MB of 64 KB reads, not the whole 64 MB
+
+
+def test_gdelt_must_check_at_least_one_collection_interval_per_run() -> None:
+    from qmemo_radar.config import RadarSettings
+
+    with pytest.raises(ValueError, match="RADAR_GDELT_MAX_MINUTES_PER_RUN"):
+        RadarSettings(
+            _env_file=None,  # type: ignore[call-arg]
+            gdelt_enabled=True,
+            collect_interval_minutes=90,
+        )
+    RadarSettings(_env_file=None, collect_interval_minutes=90)  # type: ignore[call-arg]

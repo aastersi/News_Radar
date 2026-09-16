@@ -67,8 +67,9 @@ class RadarSettings(BaseSettings):
     gdelt_enabled: bool = False
     # Minutes newer than now minus this are never requested: a 404 there may be a late file.
     gdelt_safety_lag_minutes: int = Field(default=10, ge=2, le=1440)
-    # Minute files checked per collection; bounds one catch-up run after a long downtime.
-    gdelt_max_minutes_per_run: int = Field(default=60, ge=1, le=1440)
+    # Minute files checked per collection; bounds one catch-up run after a long downtime and the
+    # items held in memory (measured: up to ~33k English quotes, ~100 MB, per hour of files).
+    gdelt_max_minutes_per_run: int = Field(default=60, ge=1, le=120)
     # Comma-separated GDELT language names (e.g. English,Spanish), case-insensitive; * = all.
     gdelt_languages: str = "English"
     gdelt_allow_unknown_language: bool = False
@@ -78,6 +79,11 @@ class RadarSettings(BaseSettings):
     def validate_thresholds_and_timezone(self) -> "RadarSettings":
         if not (self.archive_threshold <= self.digest_threshold <= self.urgent_threshold):
             raise ValueError("Thresholds must satisfy archive <= digest <= urgent")
+        if self.gdelt_enabled and self.gdelt_max_minutes_per_run < self.collect_interval_minutes:
+            raise ValueError(
+                "RADAR_GDELT_MAX_MINUTES_PER_RUN must be at least RADAR_COLLECT_INTERVAL_MINUTES,"
+                " otherwise GDELT falls further behind on every run"
+            )
         if self.cost_target_usd_monthly > self.cost_hard_limit_usd_monthly:
             raise ValueError("RADAR_COST_TARGET_USD_MONTHLY must not exceed the hard limit")
         try:

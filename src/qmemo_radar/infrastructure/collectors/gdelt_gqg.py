@@ -25,6 +25,7 @@ import zlib
 from collections import Counter
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
@@ -76,6 +77,9 @@ class GdeltQuotationCollector:
         minute = start
         stats: Counter[str] = Counter()
         fetches: list[SourceFetch] = []
+        if start > _floor_minute(now):
+            # The clock went back or the cursor is corrupt: idling silently would look healthy.
+            return _stop(fetches, start, minute, stats, "gdelt_cursor_ahead")
         while minute <= newest and stats["files_checked"] < self._max_minutes:
             stats["files_checked"] += 1
             try:
@@ -93,6 +97,9 @@ class GdeltQuotationCollector:
                 minute += _MINUTE
                 continue
             if response.status_code == 404:
+                if self._too_new_for_server(minute, response):
+                    # Our clock runs ahead of GDELT's: this file may still appear, so no gap.
+                    return _stop(fetches, start, minute, stats, "gdelt_clock_ahead")
                 stats["expected_gaps"] += 1
             elif response.status_code == 200:
                 stats["files_found"] += 1
@@ -106,6 +113,14 @@ class GdeltQuotationCollector:
             minute += _MINUTE
         fetches.append(SourceFetch(source_key=SOURCE_KEY, cursor=_cursor(minute), stats=stats))
         return fetches
+
+    def _too_new_for_server(self, minute: datetime, response: httpx.Response) -> bool:
+        try:
+            server_now = parsedate_to_datetime(response.headers.get("date", ""))
+        except (TypeError, ValueError):
+            return False  # no usable Date header: trust the local clock
+        # One minute of tolerance for ordinary clock skew; the safety lag covers the rest.
+        return minute > server_now - self._safety_lag + _MINUTE
 
     def _parse(
         self, body: bytes, minute: datetime
@@ -121,6 +136,8 @@ class GdeltQuotationCollector:
                     total += len(line)
                     oversized = len(line) > MAX_LINE_BYTES
                     while line and not line.endswith(b"\n") and oversized:  # skip the whole row
+                        if total > MAX_DECOMPRESSED_BYTES:
+                            break
                         line = stream.readline(MAX_LINE_BYTES)
                         total += len(line)
                     rows += 1
@@ -257,7 +274,7 @@ def _parse_cursor(value: str | None) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.strptime(value, _CURSOR_FORMAT).replace(tzinfo=UTC)
+        return _floor_minute(datetime.strptime(value, _CURSOR_FORMAT).replace(tzinfo=UTC))
     except ValueError:
         logger.warning(
             "gdelt cursor invalid, starting from the lookback window",

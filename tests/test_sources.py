@@ -397,7 +397,9 @@ async def test_gdelt_and_rss_run_together_free_while_paid_x_is_blocked(
             ).rss
         }
     )
-    config = settings(**X_ON, gdelt_enabled=True, gdelt_max_minutes_per_run=1)
+    config = settings(
+        **X_ON, gdelt_enabled=True, collect_interval_minutes=5, gdelt_max_minutes_per_run=5
+    )
     context = SourceContext(
         config,
         sources,
@@ -409,7 +411,7 @@ async def test_gdelt_and_rss_run_together_free_while_paid_x_is_blocked(
 
     counters = await pipeline(collector, repository).run_once()
 
-    assert counters.inserted == 2  # the GDELT quote and the RSS entry
+    assert counters.inserted == 2  # the GDELT quote (same in every file) and the RSS entry
     assert counters.source_errors == 2  # the two X queries, blocked before any request
     assert "api.x.com" not in requests
     assert await repository.cost_since(month_start(now)) == Decimal(10)  # nothing added
@@ -430,7 +432,7 @@ async def test_free_sources_alone_never_touch_the_cost_ledger(
     sources = SourcesConfig.model_validate(
         {"rss": {"feeds": [{"name": "wire", "url": "https://wire.example/rss"}]}}
     )
-    config = settings(gdelt_enabled=True, gdelt_max_minutes_per_run=3)
+    config = settings(gdelt_enabled=True, collect_interval_minutes=5, gdelt_max_minutes_per_run=5)
     http = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(404)))
     collector = build_collector(SourceContext(config, sources, x_client=None, free_http=http))
 
