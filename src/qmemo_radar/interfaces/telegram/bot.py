@@ -1,5 +1,7 @@
 """aiogram glue: turns updates into controller calls and sends replies. No decisions here."""
 
+import logging
+from collections.abc import Awaitable
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, Router
@@ -19,6 +21,8 @@ from qmemo_radar.exceptions import DeliveryFailed
 from qmemo_radar.interfaces.telegram import render
 from qmemo_radar.interfaces.telegram.controller import Reply, Send, TelegramController
 from qmemo_radar.interfaces.telegram.render import Keyboard
+
+logger = logging.getLogger(__name__)
 
 BOT_COMMANDS = [
     BotCommand(command="today", description="Карточки за сегодня"),
@@ -43,14 +47,16 @@ def build_dispatcher(controller: TelegramController) -> Dispatcher:
     @router.message()
     async def on_message(message: Message, bot: Bot) -> None:
         user_id = message.from_user.id if message.from_user else None
-        await controller.handle_message(user_id, message.text or "", _sender(bot, message.chat.id))
+        send = _sender(bot, message.chat.id)
+        await _guarded(controller.handle_message(user_id, message.text or "", send), send)
 
     @router.callback_query()
     async def on_callback(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer()
         chat_id = callback.message.chat.id if callback.message else callback.from_user.id
-        await controller.handle_callback(
-            callback.from_user.id, callback.data or "", _sender(bot, chat_id)
+        send = _sender(bot, chat_id)
+        await _guarded(
+            controller.handle_callback(callback.from_user.id, callback.data or "", send), send
         )
 
     dispatcher = Dispatcher()
@@ -92,3 +98,22 @@ def _sender(bot: Bot, chat_id: int) -> Send:
         await bot.send_message(chat_id, reply.text, reply_markup=markup(reply.keyboard))
 
     return send
+
+
+async def _guarded(handling: Awaitable[None], send: Send) -> None:
+    """Last-resort boundary: log the failure without payloads and tell the user."""
+    try:
+        await handling
+    except Exception as exc:
+        logger.exception(
+            "telegram update failed",
+            extra={
+                "operation": "telegram_update",
+                "result": "error",
+                "error_code": type(exc).__name__,
+            },
+        )
+        try:
+            await send(Reply("Внутренняя ошибка. Повторное нажатие безопасно, попробуйте ещё раз."))
+        except TelegramAPIError:
+            pass

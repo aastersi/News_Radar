@@ -1,4 +1,4 @@
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from typing import Protocol
 
@@ -9,6 +9,7 @@ from qmemo_radar.domain import (
     EventCandidate,
     EventStatus,
     FeedbackAction,
+    OutboxStatus,
     PublicationPackage,
     RawSourceItem,
     ScoredEvent,
@@ -174,3 +175,25 @@ class DraftRepository(ReviewRepository, Protocol):
     async def mark_verified(self, draft_id: str, *, telegram_user_id: int) -> bool: ...
 
     async def reject_draft(self, draft: Draft, *, telegram_user_id: int) -> bool: ...
+
+
+class OutboxRepository(DraftRepository, Protocol):
+    async def approve(
+        self,
+        draft_id: str,
+        *,
+        telegram_user_id: int,
+        build_package: Callable[[EventCandidate, Draft], PublicationPackage],
+    ) -> PublicationPackage | None:
+        """In one transaction: re-read the event and latest draft, build the package,
+        insert it with ON CONFLICT DO NOTHING, store feedback and mark the event APPROVED.
+        Returns None and changes nothing when the state no longer allows approval."""
+        ...
+
+    async def get_package(self, event_id: str) -> PublicationPackage | None: ...
+
+    async def list_packages(
+        self, status: OutboxStatus, *, limit: int
+    ) -> list[PublicationPackage]: ...
+
+    async def count_packages(self, status: OutboxStatus) -> int: ...

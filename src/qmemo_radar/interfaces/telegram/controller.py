@@ -70,7 +70,8 @@ class TelegramController:
             report = await self._review.today()
             await send(Reply(render.today_text(report, timezone=self._timezone)))
         elif command == "/saved":
-            await send(Reply(render.saved_text(await self._review.snoozed())))
+            packages = await self._drafts.approved_packages()
+            await send(Reply(render.saved_text(await self._review.snoozed(), packages)))
         elif command in ("/pause", "/resume"):
             await self._review.set_paused(command == "/pause")
             state = "поставлен на паузу" if command == "/pause" else "снова работает"
@@ -106,6 +107,9 @@ class TelegramController:
             await send(Reply("⏳ Переделываю…"))
             result = await self._drafts.revise(item_id, self._allowed_user_id, _REVISIONS[action])
             await self._send_draft(result, send)
+        elif scope == "d" and action == "ok":
+            result = await self._drafts.accept(item_id, self._allowed_user_id)
+            await send(Reply(_accept_reply(result)))
         elif scope == "d" and action == "ver":
             await self._send_draft(await self._drafts.verify(item_id, self._allowed_user_id), send)
         elif scope == "d" and action == "rej":
@@ -159,3 +163,18 @@ def _link_reply(outcome: Outcome) -> str:
         Outcome.ALREADY_DECIDED: "Эта публикация уже есть в Radar.",
         Outcome.INVALID: "Нужна ссылка вида https://x.com/имя/status/123.",
     }.get(outcome, "Не удалось загрузить публикацию из X. Попробуйте позже.")
+
+
+def _accept_reply(result: DraftResult) -> str:
+    if result.outcome is DraftOutcome.APPROVED and result.package is not None:
+        return (
+            "✅ Принято. Пакет публикации сохранён в outbox "
+            f"(<code>{render.esc(result.package.package_id)}</code>).\n"
+            "Публикация в QMemo и X выключена: внешних запросов не было."
+        )
+    return {
+        DraftOutcome.ALREADY_APPROVED: "Материал уже одобрен, пакет в outbox уже есть.",
+        DraftOutcome.NEEDS_VERIFICATION: (
+            "Сначала проверьте факты и нажмите «🔎 Проверено вручную»."
+        ),
+    }.get(result.outcome, _DRAFT_MESSAGES.get(result.outcome, _STALE_BUTTON))

@@ -10,6 +10,7 @@ from qmemo_radar.domain import (
     Draft,
     EventStatus,
     FactCheckStatus,
+    PublicationPackage,
     ScoredEvent,
     ScoreResult,
 )
@@ -21,7 +22,7 @@ CALLBACK_LIMIT_BYTES = 64
 HELP_TEXT = (
     "<b>QMemo News Radar</b>\n"
     "/today — карточки за сегодня и очередь\n"
-    "/saved — отложенные события\n"
+    "/saved — отложенные и одобренные материалы\n"
     "/pause — остановить автоматический сбор и отправку\n"
     "/resume — продолжить\n\n"
     "Можно прислать ссылку вида https://x.com/имя/status/123 — она будет оценена "
@@ -180,9 +181,15 @@ def today_text(report: TodayReport, *, timezone: ZoneInfo) -> str:
     return "\n".join(lines)
 
 
-def saved_text(snoozed: Sequence[ScoredEvent]) -> str:
+def saved_text(snoozed: Sequence[ScoredEvent], packages: Sequence[PublicationPackage]) -> str:
     lines = [f"<b>Отложено: {len(snoozed)}</b>"]
     lines += [_list_line(card) for card in snoozed]
+    lines += ["", f"<b>Одобрено, ждёт публикации (outbox): {len(packages)}</b>"]
+    lines += [
+        f"• «{esc(package.quote_text[:80])}» — {esc(package.quote_author)} · "
+        f"{link(str(package.source_url), 'источник')}"
+        for package in packages
+    ]
     return "\n".join(lines)
 
 

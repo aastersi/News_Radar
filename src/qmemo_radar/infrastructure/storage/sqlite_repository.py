@@ -1,6 +1,6 @@
 import json
 import sqlite3
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from importlib.resources import files
@@ -17,6 +17,8 @@ from qmemo_radar.domain import (
     EventStatus,
     FactCheckStatus,
     FeedbackAction,
+    OutboxStatus,
+    PublicationPackage,
     ScoreBreakdown,
     ScoredEvent,
     ScoreResult,
@@ -579,6 +581,106 @@ class SQLiteEventRepository:
                 db, draft.event_id, draft.draft_id, FeedbackAction.REJECT, telegram_user_id, now
             )
         return True
+
+    async def approve(
+        self,
+        draft_id: str,
+        *,
+        telegram_user_id: int,
+        build_package: Callable[[EventCandidate, Draft], PublicationPackage],
+    ) -> PublicationPackage | None:
+        now = datetime.now(UTC).isoformat()
+        async with self._transaction() as db:
+            latest = list(
+                await db.execute_fetchall(
+                    """
+                    SELECT * FROM drafts
+                    WHERE event_id = (SELECT event_id FROM drafts WHERE id = ?)
+                    ORDER BY version DESC LIMIT 1
+                    """,
+                    (draft_id,),
+                )
+            )
+            if not latest or latest[0]["id"] != draft_id:
+                await db.rollback()
+                return None
+            draft = _draft_from_row(latest[0])
+            [event_row] = await db.execute_fetchall(
+                "SELECT * FROM radar_events WHERE id = ?", (draft.event_id,)
+            )
+            try:
+                package = build_package(self._event_from_row(event_row), draft)
+            except ValueError:
+                await db.rollback()
+                return None
+
+            inserted = await db.execute(
+                """
+                INSERT INTO publication_outbox (
+                    id, event_id, draft_id, payload_json, idempotency_key, status,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(idempotency_key) DO NOTHING
+                """,
+                (
+                    package.package_id,
+                    package.event_id,
+                    package.draft_id,
+                    package.model_dump_json(),
+                    package.idempotency_key,
+                    package.status.value,
+                    now,
+                    now,
+                ),
+            )
+            await _insert_feedback(
+                db, draft.event_id, draft_id, FeedbackAction.ACCEPT, telegram_user_id, now
+            )
+            accepted = await db.execute(
+                "UPDATE drafts SET status = ? WHERE id = ? AND status = ?",
+                (DraftStatus.ACCEPTED.value, draft_id, DraftStatus.ACTIVE.value),
+            )
+            approved = await db.execute(
+                "UPDATE radar_events SET status = ?, updated_at = ? WHERE id = ? AND status = ?",
+                (EventStatus.APPROVED.value, now, draft.event_id, EventStatus.DRAFTED.value),
+            )
+            if accepted.rowcount != 1 or approved.rowcount != 1:
+                await db.rollback()
+                return None
+            if inserted.rowcount == 0:
+                [(payload,)] = await db.execute_fetchall(
+                    "SELECT payload_json FROM publication_outbox WHERE idempotency_key = ?",
+                    (package.idempotency_key,),
+                )
+                package = PublicationPackage.model_validate_json(payload)
+        return package
+
+    async def get_package(self, event_id: str) -> PublicationPackage | None:
+        async with self._connect() as db:
+            rows = list(
+                await db.execute_fetchall(
+                    "SELECT payload_json FROM publication_outbox WHERE event_id = ?", (event_id,)
+                )
+            )
+        return PublicationPackage.model_validate_json(rows[0][0]) if rows else None
+
+    async def list_packages(self, status: OutboxStatus, *, limit: int) -> list[PublicationPackage]:
+        async with self._connect() as db:
+            rows = await db.execute_fetchall(
+                """
+                SELECT payload_json FROM publication_outbox
+                WHERE status = ? ORDER BY created_at DESC LIMIT ?
+                """,
+                (status.value, limit),
+            )
+        return [PublicationPackage.model_validate_json(row[0]) for row in rows]
+
+    async def count_packages(self, status: OutboxStatus) -> int:
+        async with self._connect() as db:
+            [(count,)] = await db.execute_fetchall(
+                "SELECT COUNT(*) FROM publication_outbox WHERE status = ?", (status.value,)
+            )
+        return int(count)
 
     @classmethod
     def _scored_from_row(cls, row: aiosqlite.Row) -> ScoredEvent:

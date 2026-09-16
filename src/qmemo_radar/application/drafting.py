@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 
-from qmemo_radar.application.ports import DraftRepository, DraftWriter
+from qmemo_radar.application.outbox import build_publication_package
+from qmemo_radar.application.ports import DraftWriter, OutboxRepository
 from qmemo_radar.domain import (
     Draft,
     DraftStatus,
@@ -15,6 +16,8 @@ from qmemo_radar.domain import (
     EventStatus,
     FactCheckStatus,
     FeedbackAction,
+    OutboxStatus,
+    PublicationPackage,
     ScoredEvent,
 )
 from qmemo_radar.exceptions import DraftFailed
@@ -48,12 +51,16 @@ class DraftOutcome(StrEnum):
     STALE = "STALE"
     LIMIT_REACHED = "LIMIT_REACHED"
     FAILED = "FAILED"
+    NEEDS_VERIFICATION = "NEEDS_VERIFICATION"
+    APPROVED = "APPROVED"
+    ALREADY_APPROVED = "ALREADY_APPROVED"
 
 
 @dataclass(frozen=True, slots=True)
 class DraftResult:
     outcome: DraftOutcome
     draft: Draft | None = None
+    package: PublicationPackage | None = None
 
 
 def normalize_for_quote(value: str) -> str:
@@ -73,7 +80,7 @@ class DraftService:
     def __init__(
         self,
         *,
-        repository: DraftRepository,
+        repository: OutboxRepository,
         writer: DraftWriter,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
@@ -176,6 +183,38 @@ class DraftService:
         if not await self._repository.reject_draft(draft, telegram_user_id=user_id):
             return DraftResult(DraftOutcome.STALE)
         return DraftResult(DraftOutcome.CREATED, draft)
+
+    async def accept(self, draft_id: str, user_id: int) -> DraftResult:
+        """Approve the latest verified draft into exactly one outbox package. Never publishes."""
+        draft = await self._repository.get_draft(draft_id)
+        if draft is None:
+            return DraftResult(DraftOutcome.NOT_FOUND)
+        existing = await self._repository.get_package(draft.event_id)
+        if existing is not None:
+            return DraftResult(DraftOutcome.ALREADY_APPROVED, draft, existing)
+        stale = await self._stale(draft)
+        if stale:
+            return stale
+        if draft.fact_check_status is not FactCheckStatus.VERIFIED:
+            return DraftResult(DraftOutcome.NEEDS_VERIFICATION, draft)
+
+        package = await self._repository.approve(
+            draft_id,
+            telegram_user_id=user_id,
+            build_package=lambda event, latest: build_publication_package(
+                event, latest, approved_by=user_id, approved_at=self._clock()
+            ),
+        )
+        if package is None:
+            return DraftResult(DraftOutcome.STALE, draft)
+        logger.info(
+            "publication package stored",
+            extra={"event_id": draft.event_id, "operation": "approve", "result": "outbox"},
+        )
+        return DraftResult(DraftOutcome.APPROVED, draft, package)
+
+    async def approved_packages(self, *, limit: int = 10) -> list[PublicationPackage]:
+        return await self._repository.list_packages(OutboxStatus.APPROVED, limit=limit)
 
     async def _stale(self, draft: Draft) -> DraftResult | None:
         latest = await self._repository.latest_draft(draft.event_id)
