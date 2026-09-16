@@ -2,8 +2,16 @@ from enum import StrEnum
 
 
 class SourceType(StrEnum):
+    """Where an item came from. Stored as plain TEXT without a CHECK constraint, so a new
+    member is a code change only: no database migration is needed."""
+
     X = "x"
     RSS = "rss"
+    GDELT = "gdelt"
+    BLUESKY = "bluesky"
+    HACKER_NEWS = "hacker_news"
+    GITHUB = "github"
+    YOUTUBE = "youtube"
     MANUAL = "manual"
 
 

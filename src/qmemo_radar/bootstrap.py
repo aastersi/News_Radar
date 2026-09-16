@@ -3,8 +3,8 @@
 import json
 import logging
 import sys
-from collections.abc import AsyncIterator, Sequence
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Callable, Sequence
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 import httpx
 
 from qmemo_radar.application.budget import BudgetGuard, PaidFeature
+from qmemo_radar.application.collection import MultiSourceCollector
 from qmemo_radar.application.drafting import DraftService
 from qmemo_radar.application.filtering import FilterPolicy
 from qmemo_radar.application.normalization import comparison_text
@@ -36,7 +37,7 @@ from qmemo_radar.infrastructure.collectors.x_api import (
     XQuery,
     XRecentSearchCollector,
 )
-from qmemo_radar.infrastructure.drafting import LlmDraftWriter
+from qmemo_radar.infrastructure.drafting import DisabledDraftWriter, LlmDraftWriter
 from qmemo_radar.infrastructure.llm import ChatCompletionsClient
 from qmemo_radar.infrastructure.publishing import DisabledQuotePublisher, DisabledXPublisher
 from qmemo_radar.infrastructure.ranking import LlmRanker
@@ -89,7 +90,7 @@ def build_pipeline(
     application: Application,
     *,
     collector: SourceCollector,
-    ranker: Ranker,
+    ranker: Ranker | None,
     sources: SourcesConfig | None = None,
 ) -> RadarPipeline:
     settings = application.settings
@@ -119,7 +120,7 @@ def build_services(
     application: Application,
     *,
     collector: SourceCollector,
-    ranker: Ranker,
+    ranker: Ranker | None,
     writer: DraftWriter,
     gateway: ReviewGateway,
     lookup: PostLookup | None,
@@ -163,9 +164,69 @@ def build_publishers(settings: RadarSettings) -> tuple[QuotePublisher, XPublishe
     return DisabledQuotePublisher(), DisabledXPublisher()
 
 
+@dataclass(frozen=True, slots=True)
+class SourceContext:
+    """What collector factories may use. Paid clients are None unless their feature is on."""
+
+    settings: RadarSettings
+    sources: SourcesConfig
+    x_client: XApiClient | None
+
+
+@dataclass(frozen=True, slots=True)
+class SourceRegistration:
+    name: str
+    enabled: Callable[[RadarSettings, SourcesConfig], bool]
+    build: Callable[[SourceContext], SourceCollector]
+
+
+def _x_search_enabled(settings: RadarSettings, sources: SourcesConfig) -> bool:
+    configured = any(item.enabled for item in sources.x.accounts) or any(
+        item.enabled for item in sources.x.queries
+    )
+    return settings.x_search_enabled and configured
+
+
+def _build_x_search(context: SourceContext) -> SourceCollector:
+    if context.x_client is None:
+        raise ValueError("RADAR_X_BEARER_TOKEN is required for X search")
+    return build_x_collector(context.x_client, context.settings, context.sources)
+
+
+# One entry per source type. A disabled entry is never built, so it needs no credentials.
+# M3 adds `gdelt_gqg` and `rss` here.
+SOURCE_REGISTRY: tuple[SourceRegistration, ...] = (
+    SourceRegistration("x_search", _x_search_enabled, _build_x_search),
+)
+
+
+def enabled_sources(
+    settings: RadarSettings,
+    sources: SourcesConfig,
+    registry: Sequence[SourceRegistration] = SOURCE_REGISTRY,
+) -> list[str]:
+    return [entry.name for entry in registry if entry.enabled(settings, sources)]
+
+
+def build_collector(
+    context: SourceContext,
+    registry: Sequence[SourceRegistration] = SOURCE_REGISTRY,
+) -> MultiSourceCollector:
+    return MultiSourceCollector(
+        {
+            entry.name: entry.build(context)
+            for entry in registry
+            if entry.enabled(context.settings, context.sources)
+        }
+    )
+
+
 @asynccontextmanager
 async def build_runtime(settings: RadarSettings, sources: SourcesConfig) -> AsyncIterator[Runtime]:
-    """Wire production adapters and close every HTTP client and the bot session on exit."""
+    """Wire production adapters and close every HTTP client and the bot session on exit.
+
+    Paid clients are created only for enabled paid features, and all of them share one guard.
+    """
     from qmemo_radar.interfaces.telegram.bot import (
         TelegramReviewGateway,
         build_bot,
@@ -177,48 +238,53 @@ async def build_runtime(settings: RadarSettings, sources: SourcesConfig) -> Asyn
         raise ValueError("RADAR_TELEGRAM_BOT_TOKEN and RADAR_ALLOWED_TELEGRAM_ID are required")
     quote_publisher, x_publisher = build_publishers(settings)
     application = build_application(settings)
-    async with build_x_http_client(settings) as x_http, build_llm_http_client(settings) as llm_http:
-        bot = build_bot(settings.telegram_bot_token.get_secret_value())
-        try:
-            guard = build_budget_guard(settings, application.repository)
+    guard = build_budget_guard(settings, application.repository)
+    async with AsyncExitStack() as stack:
+        x_client = None
+        if settings.paid_sources_enabled and settings.x_bearer_token is not None:
+            x_http = await stack.enter_async_context(build_x_http_client(settings))
             x_client = XApiClient(x_http, guard=guard)
+        llm = None
+        if settings.paid_llm_enabled:
+            llm_http = await stack.enter_async_context(build_llm_http_client(settings))
             llm = build_llm_client(settings, llm_http, guard)
-            services = build_services(
-                application,
-                collector=build_x_collector(x_client, settings, sources),
-                ranker=LlmRanker(llm),
-                writer=LlmDraftWriter(llm),
-                gateway=TelegramReviewGateway(
-                    bot, chat_id=settings.allowed_telegram_id, timezone=settings.zone
-                ),
-                lookup=x_client,
-                sources=sources,
-            )
-            controller = TelegramController(
-                allowed_user_id=settings.allowed_telegram_id,
-                review=services.review,
-                drafts=services.drafts,
+        bot = build_bot(settings.telegram_bot_token.get_secret_value())
+        stack.push_async_callback(bot.session.close)
+
+        services = build_services(
+            application,
+            collector=build_collector(SourceContext(settings, sources, x_client)),
+            ranker=LlmRanker(llm) if llm else None,
+            writer=LlmDraftWriter(llm) if llm else DisabledDraftWriter(),
+            gateway=TelegramReviewGateway(
+                bot, chat_id=settings.allowed_telegram_id, timezone=settings.zone
+            ),
+            lookup=x_client,
+            sources=sources,
+        )
+        controller = TelegramController(
+            allowed_user_id=settings.allowed_telegram_id,
+            review=services.review,
+            drafts=services.drafts,
+            runner=services.runner,
+            timezone=settings.zone,
+        )
+        yield Runtime(
+            repository=application.repository,
+            services=services,
+            scheduler=RadarScheduler(
                 runner=services.runner,
+                review=services.review,
+                collect_every=timedelta(minutes=settings.collect_interval_minutes),
+                digest_times=settings.digest_schedule,
                 timezone=settings.zone,
-            )
-            yield Runtime(
-                repository=application.repository,
-                services=services,
-                scheduler=RadarScheduler(
-                    runner=services.runner,
-                    review=services.review,
-                    collect_every=timedelta(minutes=settings.collect_interval_minutes),
-                    digest_times=settings.digest_schedule,
-                    timezone=settings.zone,
-                ),
-                controller=controller,
-                bot=bot,
-                dispatcher=build_dispatcher(controller),
-                quote_publisher=quote_publisher,
-                x_publisher=x_publisher,
-            )
-        finally:
-            await bot.session.close()
+            ),
+            controller=controller,
+            bot=bot,
+            dispatcher=build_dispatcher(controller),
+            quote_publisher=quote_publisher,
+            x_publisher=x_publisher,
+        )
 
 
 def build_x_http_client(settings: RadarSettings) -> httpx.AsyncClient:

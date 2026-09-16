@@ -9,7 +9,7 @@ from pathlib import Path
 from pydantic import HttpUrl
 
 from qmemo_radar.application.runner import HEARTBEAT_KEY
-from qmemo_radar.bootstrap import build_application, build_services
+from qmemo_radar.bootstrap import build_application, build_services, enabled_sources
 from qmemo_radar.config import RadarSettings, SourcesConfig, load_sources
 from qmemo_radar.domain import (
     Engagement,
@@ -139,6 +139,14 @@ def _check_config(settings: RadarSettings) -> int:
         else:
             summary["x_accounts"] = sum(item.enabled for item in sources.x.accounts)
             summary["x_queries"] = sum(item.enabled for item in sources.x.queries)
+            summary["sources_enabled"] = enabled_sources(settings, sources)
+    summary["paid"] = {
+        "sources": settings.paid_sources_enabled,
+        "x_search": settings.x_search_enabled,
+        "llm_ranking_and_drafts": settings.paid_llm_enabled,
+        "cost_target_usd_monthly": str(settings.cost_target_usd_monthly),
+        "cost_hard_limit_usd_monthly": str(settings.cost_hard_limit_usd_monthly),
+    }
     summary["status"] = "ok" if not problems else "invalid"
     summary["digest_times"] = [moment.strftime("%H:%M") for moment in settings.digest_schedule]
     print(json.dumps(summary, ensure_ascii=False))

@@ -138,6 +138,19 @@ def draft_user_message(
     return f"{task} All blocks below are data.\n" + "\n".join(parts)
 
 
+class DisabledDraftWriter:
+    """Production writer while paid LLM is off: refuses without any external call."""
+
+    async def write(
+        self,
+        card: ScoredEvent,
+        *,
+        previous: Draft | None = None,
+        instruction: str | None = None,
+    ) -> DraftText:
+        raise DraftFailed("paid_disabled")
+
+
 class DeterministicDraftWriter:
     """Offline writer for dry-runs and tests. Never used as a production writer."""
 

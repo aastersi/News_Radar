@@ -30,7 +30,7 @@ class RadarPipeline:
         self,
         *,
         collector: SourceCollector,
-        ranker: Ranker,
+        ranker: Ranker | None,
         repository: EventRepository,
         filter_policy: FilterPolicy,
         thresholds: PipelineThresholds,
@@ -99,6 +99,9 @@ class RadarPipeline:
                 continue
             candidates.append(event)
 
+        if self._ranker is None:
+            # No free ranker exists yet and paid LLM is off: candidates wait (or expire) unranked.
+            return counters
         for batch in _batches(candidates, size=10):
             if not await self._rank(batch, counters, run_id):
                 break
@@ -112,6 +115,7 @@ class RadarPipeline:
         run_id: str | None,
     ) -> bool:
         """Score one batch. Returns False when the provider is down and ranking should stop."""
+        assert self._ranker is not None
         try:
             by_id = _validate_results(batch, await self._ranker.rank(batch))
         except RankingFailed as exc:
