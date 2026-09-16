@@ -11,6 +11,7 @@ import aiosqlite
 
 from qmemo_radar.application.ports import KnownEvents
 from qmemo_radar.domain import (
+    SHARED_URL_SOURCES,
     CostEntry,
     DeliveryKind,
     Draft,
@@ -114,6 +115,8 @@ class SQLiteEventRepository:
                     (source, *external_ids),
                 )
                 ids.update((source, str(row[0])) for row in rows)
+                if source in SHARED_URL_SOURCES:
+                    continue  # not a duplicate key, and the URL index does not cover this source
                 group_urls = [str(event.url) for event in group]
                 rows = await db.execute_fetchall(
                     f"SELECT url FROM radar_events WHERE source = ? "

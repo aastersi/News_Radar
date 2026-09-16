@@ -15,6 +15,11 @@ class SourceType(StrEnum):
     MANUAL = "manual"
 
 
+# Sources whose items share a URL (GDELT: one item per quote of an article). Their URL is not a
+# duplicate key; the partial unique index in migration 009 must list the same sources.
+SHARED_URL_SOURCES = frozenset({SourceType.GDELT})
+
+
 class Metric(StrEnum):
     """Flow metrics stored per run and source in `pipeline_metrics`."""
 

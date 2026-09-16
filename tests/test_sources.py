@@ -4,6 +4,7 @@ import sqlite3
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 import httpx
 import pytest
@@ -268,3 +269,74 @@ async def test_copy_of_an_ignored_original_is_stored_without_a_dangling_link(
             "SELECT id, external_id, duplicate_of_event_id FROM radar_events ORDER BY rowid"
         ).fetchall()
     assert rows == [(stored.event_id, "rss-1", None), (copy.event_id, "gdelt-2", None)]
+
+
+async def test_quotes_of_one_article_share_its_url_but_other_sources_do_not(
+    repository: SQLiteEventRepository,
+) -> None:
+    def quote(source: SourceType, number: int) -> RawSourceItem:
+        return article(source, number).model_copy(
+            update={
+                "url": "https://news.example/story",
+                "original_text": f"{source.value} quote {number} " * 3,
+            }
+        )
+
+    gdelt = Feed("gdelt:gqg", [quote(SourceType.GDELT, 1), quote(SourceType.GDELT, 2)])
+    rss = Feed("rss:wire", [quote(SourceType.RSS, 1), quote(SourceType.RSS, 2)])
+
+    counters = await pipeline(MultiSourceCollector({"g": gdelt, "r": rss}), repository).run_once()
+
+    assert (counters.inserted, counters.duplicates) == (3, 1)
+    with sqlite3.connect(repository._db_path) as db:
+        rows = db.execute("SELECT source, COUNT(*) FROM radar_events GROUP BY source").fetchall()
+        assert rows == [("gdelt", 2), ("rss", 1)]
+        # The database, not only the pipeline, still rejects a second RSS row with that URL.
+        with pytest.raises(sqlite3.IntegrityError, match="source, radar_events.url"):
+            db.execute(
+                "INSERT INTO radar_events (id, source, external_id, url, original_text,"
+                " normalized_text, content_hash, published_at, discovered_at, status,"
+                " created_at, updated_at) SELECT 'copy', source, 'other', url, original_text,"
+                " normalized_text, content_hash, published_at, discovered_at, status,"
+                " created_at, updated_at FROM radar_events WHERE source = 'rss'"
+            )
+
+
+async def test_upgrade_to_shared_quote_urls_keeps_rows_and_children(tmp_path: Path) -> None:
+    from importlib.resources import files
+
+    path = tmp_path / "old.db"
+    migrations = sorted(
+        item
+        for item in files("qmemo_radar.infrastructure.storage.migrations").iterdir()
+        if item.name.endswith(".sql") and int(item.name[:3]) <= 8
+    )
+    with sqlite3.connect(path) as db:
+        for migration in migrations:
+            db.executescript(migration.read_text(encoding="utf-8"))
+    old = SQLiteEventRepository(path)
+    first = build_candidate(article(SourceType.RSS, 1))
+    copy = build_candidate(article(SourceType.RSS, 2)).model_copy(
+        update={"duplicate_of_event_id": first.event_id}
+    )
+    assert await old.add_events([first, copy]) == 2
+    with sqlite3.connect(path) as db:
+        db.execute(
+            "INSERT INTO feedback (event_id, action, telegram_user_id, created_at)"
+            " VALUES (?, 'SKIP', 1, 'now')",
+            (first.event_id,),
+        )
+
+    await SQLiteEventRepository(path).initialize()
+
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone() == (9,)
+        assert db.execute(
+            "SELECT rowid, id, duplicate_of_event_id FROM radar_events ORDER BY rowid"
+        ).fetchall() == [(1, first.event_id, None), (2, copy.event_id, first.event_id)]
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert db.execute("SELECT event_id FROM feedback").fetchall() == [(first.event_id,)]
+        indexes = {row[1] for row in db.execute("PRAGMA index_list(radar_events)")}
+    assert {"idx_events_source_url", "idx_events_content_hash", "idx_events_duplicate_of"} <= set(
+        indexes
+    )

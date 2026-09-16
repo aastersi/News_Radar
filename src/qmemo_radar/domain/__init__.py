@@ -1,4 +1,5 @@
 from qmemo_radar.domain.enums import (
+    SHARED_URL_SOURCES,
     DeliveryKind,
     DraftStatus,
     EventStatus,
@@ -29,6 +30,7 @@ from qmemo_radar.domain.models import (
 
 __all__ = [
     "QMEMO_URL_PLACEHOLDER",
+    "SHARED_URL_SOURCES",
     "CostEntry",
     "DeliveryKind",
     "Draft",

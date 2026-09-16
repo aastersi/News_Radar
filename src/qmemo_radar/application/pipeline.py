@@ -14,6 +14,7 @@ from qmemo_radar.application.normalization import build_candidate
 from qmemo_radar.application.ports import EventRepository, Ranker, SourceCollector
 from qmemo_radar.application.scoring import calculate_total
 from qmemo_radar.domain import (
+    SHARED_URL_SOURCES,
     EventCandidate,
     EventStatus,
     Metric,
@@ -211,11 +212,13 @@ class RadarPipeline:
         for event in events:
             id_key = (event.source.value, event.external_id)
             url_key = (event.source.value, str(event.url))
-            if id_key in ids or url_key in urls:
+            shared_url = event.source in SHARED_URL_SOURCES
+            if id_key in ids or (not shared_url and url_key in urls):
                 stats[Metric.EXACT_DUPLICATES] += 1
                 continue
             ids.add(id_key)
-            urls.add(url_key)
+            if not shared_url:
+                urls.add(url_key)
             reason = first_filter_reason(event, self._filter_policy, now=now)
             original = None if reason else owners.get(event.content_hash)
             if original:
