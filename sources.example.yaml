@@ -1,0 +1,12 @@
+x:
+  accounts:
+    - handle: example_founder
+      enabled: true
+  queries:
+    - name: crypto_predictions
+      query: '(crypto OR Solana) (predicts OR says OR promises) -is:retweet'
+      enabled: true
+
+blocked_authors: []
+blocked_terms: []
+

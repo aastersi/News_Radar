@@ -1,0 +1,11 @@
+services:
+  radar:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - radar_data:/app/data
+
+volumes:
+  radar_data:
+
