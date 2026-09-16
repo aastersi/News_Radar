@@ -18,6 +18,7 @@ import logging
 import re
 import socket
 import xml.etree.ElementTree as ElementTree
+import xml.parsers.expat
 from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -37,6 +38,7 @@ logger = logging.getLogger(__name__)
 MAX_REDIRECTS = 5
 MAX_CONCURRENT_FEEDS = 8
 MAX_SUMMARY_CHARS = 2_000
+MAX_TITLE_CHARS = 500
 _REDIRECTS = {301, 302, 303, 307, 308}
 _TAGS = re.compile(r"<[^>]*>")
 _XML_LANG = "{http://www.w3.org/XML/1998/namespace}lang"
@@ -151,9 +153,7 @@ class RssCollector:
     def _parse(
         self, feed: Feed, body: bytes, base_url: str, stats: Counter[str]
     ) -> list[RawSourceItem]:
-        if b"<!ENTITY" in body:
-            # Feeds never need entity declarations; refusing them avoids expansion attacks.
-            raise ElementTree.ParseError("entity declarations are not accepted")
+        _refuse_entity_declarations(body)
         root = ElementTree.fromstring(body)
         if _local(root.tag) not in ("rss", "feed", "rdf"):
             raise ElementTree.ParseError(f"not a feed: {_local(root.tag)}")
@@ -186,7 +186,7 @@ class RssCollector:
         link = _link(entry)
         guid = _text(_child(entry, "guid")) or _text(_child(entry, "id"))
         url = urljoin(base_url, link) if link else guid if guid.startswith("http") else ""
-        title = _plain(_text(_child(entry, "title")))
+        title = _plain(_text(_child(entry, "title")))[:MAX_TITLE_CHARS]
         summary = _plain(
             _text(_child(entry, "description"))
             or _text(_child(entry, "summary"))
@@ -220,6 +220,34 @@ class RssCollector:
             },
             source_key=feed.source_key,
         )
+
+
+class _RootReached(Exception):
+    pass
+
+
+def _refuse_entity_declarations(body: bytes) -> None:
+    """Feeds never need entity declarations; refusing them prevents entity expansion.
+
+    Checked by expat itself up to the root element, so any document encoding (e.g. UTF-16,
+    where a byte search for `<!ENTITY` finds nothing) is covered.
+    """
+
+    def entity(*_: object) -> None:
+        raise ElementTree.ParseError("entity declarations are not accepted")
+
+    def root(*_: object) -> None:
+        raise _RootReached
+
+    scanner = xml.parsers.expat.ParserCreate()
+    scanner.EntityDeclHandler = entity
+    scanner.StartElementHandler = root
+    try:
+        scanner.Parse(body, True)
+    except _RootReached:
+        return
+    except xml.parsers.expat.ExpatError as exc:
+        raise ElementTree.ParseError(str(exc)) from exc
 
 
 def _local(tag: object) -> str:

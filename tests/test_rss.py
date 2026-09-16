@@ -303,3 +303,28 @@ def test_feeds_come_from_sources_yaml_and_need_no_key() -> None:
         )
     with pytest.raises(ValueError):
         SourcesConfig.model_validate({"rss": {"feeds": [{"name": "Bad Name", "url": "https://a"}]}})
+
+
+async def test_entity_declarations_are_refused_in_any_encoding() -> None:
+    # Regression: a byte search for `<!ENTITY` missed UTF-16 documents, and expat expanded a
+    # 4.9 MB feed into a 326 MB title.
+    bomb = (
+        '<?xml version="1.0" encoding="UTF-16"?>'
+        '<!DOCTYPE rss [<!ENTITY a "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa">'
+        '<!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;">]>'
+        "<rss><channel><item><title>&b;</title><link>https://news.example/1</link></item>"
+        "</channel></rss>"
+    ).encode("utf-16")
+    long_title = (
+        "<rss><channel><item><title>" + "t" * 5000 + "</title>"
+        "<link>https://news.example/2</link></item></channel></rss>"
+    ).encode()
+    web = Web({"https://bomb.example/rss": ok(bomb), "https://long.example/rss": ok(long_title)})
+
+    fetches = await web.collector(
+        ("bomb", "https://bomb.example/rss"), ("long", "https://long.example/rss")
+    ).collect({})
+
+    by_key = {fetch.source_key: fetch for fetch in fetches}
+    assert by_key["rss:bomb"].error_code == "rss_malformed_xml"
+    assert len(by_key["rss:long"].items[0].original_text) == 500
