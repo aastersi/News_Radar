@@ -113,14 +113,16 @@ class XAccountSource(_SourcesModel):
 
 class XQuerySource(_SourcesModel):
     name: str = Field(pattern=r"^[a-z0-9_]{1,40}$")
-    query: str = Field(min_length=1, max_length=4096)
+    # Self-serve X API access allows recent-search queries of up to 512 characters.
+    query: str = Field(min_length=1, max_length=512)
     enabled: bool = True
 
 
 class XSources(_SourcesModel):
     accounts: tuple[XAccountSource, ...] = ()
     queries: tuple[XQuerySource, ...] = ()
-    max_pages_per_query: int = Field(default=3, ge=1, le=10)
+    # Each page can return up to 100 billed post reads, so one page is the safe default.
+    max_pages_per_query: int = Field(default=1, ge=1, le=10)
 
 
 class SourcesConfig(_SourcesModel):
