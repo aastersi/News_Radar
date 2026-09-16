@@ -14,6 +14,7 @@ from qmemo_radar.application.drafting import (
 )
 from qmemo_radar.application.normalization import parse_x_status_url
 from qmemo_radar.application.review import Outcome, ReviewService
+from qmemo_radar.application.runner import RadarRunner
 from qmemo_radar.interfaces.telegram import render
 from qmemo_radar.interfaces.telegram.render import Keyboard
 
@@ -52,11 +53,13 @@ class TelegramController:
         allowed_user_id: int,
         review: ReviewService,
         drafts: DraftService,
+        runner: RadarRunner,
         timezone: ZoneInfo,
     ) -> None:
         self._allowed_user_id = allowed_user_id
         self._review = review
         self._drafts = drafts
+        self._runner = runner
         self._timezone = timezone
 
     async def handle_message(self, user_id: int | None, text: str, send: Send) -> None:
@@ -66,6 +69,13 @@ class TelegramController:
         command = words[0].split("@", 1)[0].lower() if words else ""
         if command in ("/start", "/help"):
             await send(Reply(render.HELP_TEXT))
+        elif command == "/status":
+            status = await self._runner.status()
+            await send(Reply(render.status_text(status, timezone=self._timezone)))
+        elif command == "/run":
+            await send(Reply("⏳ Запускаю сбор…"))
+            result = await self._runner.run_cycle(manual=True)
+            await send(Reply(render.cycle_text(result)))
         elif command == "/today":
             report = await self._review.today()
             await send(Reply(render.today_text(report, timezone=self._timezone)))

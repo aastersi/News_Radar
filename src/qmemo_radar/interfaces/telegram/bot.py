@@ -117,3 +117,13 @@ async def _guarded(handling: Awaitable[None], send: Send) -> None:
             await send(Reply("Внутренняя ошибка. Повторное нажатие безопасно, попробуйте ещё раз."))
         except TelegramAPIError:
             pass
+
+
+async def prepare_bot(bot: Bot) -> None:
+    try:
+        await bot.set_my_commands(BOT_COMMANDS)
+    except TelegramAPIError as exc:
+        logger.warning(
+            "bot commands were not updated",
+            extra={"operation": "startup", "result": "skipped", "error_code": type(exc).__name__},
+        )

@@ -10,11 +10,15 @@ from qmemo_radar.domain import (
     EventStatus,
     FeedbackAction,
     OutboxStatus,
+    PipelineCounters,
+    PipelineRun,
     PublicationPackage,
     RawSourceItem,
+    RunStatus,
     ScoredEvent,
     ScoreResult,
     SourceFetch,
+    SourceHealth,
 )
 
 
@@ -197,3 +201,23 @@ class OutboxRepository(DraftRepository, Protocol):
     ) -> list[PublicationPackage]: ...
 
     async def count_packages(self, status: OutboxStatus) -> int: ...
+
+
+class RunRepository(OutboxRepository, Protocol):
+    async def start_run(self, run_id: str) -> None: ...
+
+    async def finish_run(
+        self,
+        run_id: str,
+        status: RunStatus,
+        counters: PipelineCounters,
+        error_code: str | None,
+    ) -> None: ...
+
+    async def fail_interrupted_runs(self) -> int: ...
+
+    async def last_run(self, statuses: set[RunStatus] | None = None) -> PipelineRun | None: ...
+
+    async def counters_since(self, since: datetime) -> PipelineCounters: ...
+
+    async def source_health(self) -> list[SourceHealth]: ...

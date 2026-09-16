@@ -2,15 +2,19 @@
 
 import html
 from collections.abc import Sequence
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from qmemo_radar.application.drafting import MAX_DRAFT_VERSIONS
 from qmemo_radar.application.review import TodayReport
+from qmemo_radar.application.runner import CycleResult, StatusReport
 from qmemo_radar.domain import (
     Draft,
     EventStatus,
     FactCheckStatus,
+    PipelineCounters,
     PublicationPackage,
+    RunStatus,
     ScoredEvent,
     ScoreResult,
 )
@@ -21,6 +25,8 @@ CALLBACK_LIMIT_BYTES = 64
 
 HELP_TEXT = (
     "<b>QMemo News Radar</b>\n"
+    "/status — состояние Radar\n"
+    "/run — собрать и оценить публикации сейчас\n"
     "/today — карточки за сегодня и очередь\n"
     "/saved — отложенные и одобренные материалы\n"
     "/pause — остановить автоматический сбор и отправку\n"
@@ -209,3 +215,93 @@ def _local_time(card: ScoredEvent, timezone: ZoneInfo) -> str:
 
 def _label(labels: dict[str, str], value: str) -> str:
     return labels.get(value, value)
+
+
+_RUN_STATUS = {
+    RunStatus.SUCCESS: "SUCCESS — всё собрано",
+    RunStatus.PARTIAL: "PARTIAL — часть источников или оценок с ошибкой",
+    RunStatus.FAILED: "FAILED — сбор не выполнен",
+    RunStatus.RUNNING: "выполняется",
+}
+
+
+def cycle_text(result: CycleResult) -> str:
+    if result.status is None:
+        reason = "сбор уже идёт" if result.skipped == "already_running" else "Radar на паузе"
+        return f"Сбор не запущен: {reason}."
+    lines = [f"<b>Сбор завершён:</b> {esc(_RUN_STATUS[result.status])}"]
+    if result.counters is not None:
+        lines.append(_counters_line(result.counters))
+    lines.append(f"Срочных карточек отправлено: {result.urgent_sent}")
+    return "\n".join(lines)
+
+
+def status_text(report: StatusReport, *, timezone: ZoneInfo) -> str:
+    alive = (
+        f"да, последний сигнал {_when(report.heartbeat_at, timezone)}"
+        if report.heartbeat_at
+        else "планировщик ещё не отмечался"
+    )
+    lines = [
+        "<b>Состояние Radar</b>",
+        f"Работает: {alive}",
+        f"Пауза: {'включена' if report.paused else 'выключена'}",
+    ]
+    last = report.last_run
+    if last is None:
+        lines.append("Сборов ещё не было.")
+    else:
+        lines.append(
+            f"Последний сбор: {_when(last.started_at, timezone)} — {esc(_RUN_STATUS[last.status])}"
+            + (f" ({esc(last.error_code)})" if last.error_code else "")
+        )
+    success = report.last_success
+    lines.append(
+        "Последний успешный сбор: "
+        + (_when(success.started_at, timezone) if success else "ещё не было")
+    )
+    failing = [source for source in report.sources if source.consecutive_failures]
+    if not report.sources:
+        lines.append("X: источники ещё не опрашивались")
+    elif failing:
+        lines.append(f"X: ошибки в {len(failing)} из {len(report.sources)} источников")
+        lines += [
+            f"• {esc(source.source_key)}: {esc(source.last_error)}"
+            f" (подряд: {source.consecutive_failures})"
+            for source in failing
+        ]
+    else:
+        lines.append(f"X: все источники в порядке ({len(report.sources)})")
+    lines.append(f"LLM: {_llm_state(last.counters if last else None)}")
+    today = report.today
+    lines += [
+        f"Сегодня: найдено {today.inserted} · отфильтровано {today.filtered} · "
+        f"оценено {today.scored} · отправлено {report.sent_today}",
+        f"Outbox APPROVED: {report.outbox_approved}",
+        "Публикация в QMemo: "
+        + ("ВКЛЮЧЕНА" if report.qmemo_publishing_enabled else "выключена")
+        + " · в X: "
+        + ("ВКЛЮЧЕНА" if report.x_publishing_enabled else "выключена"),
+    ]
+    return "\n".join(lines)
+
+
+def _llm_state(counters: PipelineCounters | None) -> str:
+    if counters is None or not (counters.scored or counters.rank_failed):
+        return "в последнем сборе не вызывалась"
+    if counters.rank_failed:
+        return f"ошибка оценки, {counters.rank_failed} событий будут оценены повторно"
+    return "в порядке"
+
+
+def _counters_line(counters: PipelineCounters) -> str:
+    return (
+        f"Получено {counters.collected} · новых {counters.inserted} · "
+        f"дублей {counters.duplicates} · отфильтровано {counters.filtered} · "
+        f"оценено {counters.scored} · в подборку {counters.shortlisted} · "
+        f"ошибок источников {counters.source_errors} · не оценено {counters.rank_failed}"
+    )
+
+
+def _when(moment: datetime, timezone: ZoneInfo) -> str:
+    return moment.astimezone(timezone).strftime("%d.%m %H:%M")

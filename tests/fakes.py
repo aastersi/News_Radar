@@ -6,11 +6,12 @@ from zoneinfo import ZoneInfo
 
 from pydantic import HttpUrl
 
-from qmemo_radar.application.drafting import DraftService
 from qmemo_radar.application.filtering import FilterPolicy
 from qmemo_radar.application.pipeline import PipelineThresholds, RadarPipeline
-from qmemo_radar.application.ports import DraftWriter
+from qmemo_radar.application.ports import DraftWriter, Ranker, SourceCollector
 from qmemo_radar.application.review import DeliveryLimits, ReviewService
+from qmemo_radar.bootstrap import Application, build_services
+from qmemo_radar.config import RadarSettings, SourcesConfig
 from qmemo_radar.domain import Engagement, RawSourceItem, ScoredEvent, SourceType
 from qmemo_radar.exceptions import DeliveryFailed, SourceUnavailable
 from qmemo_radar.infrastructure.collectors import FakeCollector
@@ -114,16 +115,33 @@ def review_service(
     )
 
 
+def settings_for(repository: SQLiteEventRepository) -> RadarSettings:
+    return RadarSettings(_env_file=None, db_path=repository._db_path, allowed_telegram_id=OWNER_ID)
+
+
 def telegram(
     repository: SQLiteEventRepository,
     gateway: FakeGateway,
     *,
     writer: DraftWriter | None = None,
     lookup: FakeLookup | None = None,
+    collector: SourceCollector | None = None,
+    ranker: Ranker | None = None,
 ) -> TelegramController:
+    """The real composition from bootstrap with fake X, LLM and Telegram at the edges."""
+    services = build_services(
+        Application(settings=settings_for(repository), repository=repository),
+        collector=collector or FakeCollector([]),
+        ranker=ranker or DeterministicFixtureRanker(),
+        writer=writer or DeterministicDraftWriter(),
+        gateway=gateway,
+        lookup=lookup,
+        sources=SourcesConfig(),
+    )
     return TelegramController(
         allowed_user_id=OWNER_ID,
-        review=review_service(repository, gateway, lookup=lookup),
-        drafts=DraftService(repository=repository, writer=writer or DeterministicDraftWriter()),
+        review=services.review,
+        drafts=services.drafts,
+        runner=services.runner,
         timezone=TIMEZONE,
     )

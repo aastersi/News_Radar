@@ -1,3 +1,4 @@
+from datetime import time
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -14,6 +15,8 @@ class RadarSettings(BaseSettings):
         env_prefix="RADAR_",
         extra="ignore",
         case_sensitive=False,
+        # `RADAR_ALLOWED_TELEGRAM_ID=` copied from .env.example means "not set", not an error.
+        env_ignore_empty=True,
     )
 
     environment: str = "development"
@@ -34,6 +37,8 @@ class RadarSettings(BaseSettings):
     collect_interval_minutes: int = Field(default=30, ge=5, le=1440)
     max_event_age_minutes: int = Field(default=60, ge=5, le=10080)
     daily_card_limit: int = Field(default=10, ge=1, le=50)
+    digest_card_limit: int = Field(default=5, ge=1, le=10)
+    digest_times: str = "10:00,15:00,20:00"
     urgent_threshold: int = Field(default=80, ge=0, le=100)
     digest_threshold: int = Field(default=65, ge=0, le=100)
     archive_threshold: int = Field(default=50, ge=0, le=100)
@@ -44,21 +49,57 @@ class RadarSettings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_thresholds_and_timezone(self) -> "RadarSettings":
-        if not (
-            self.archive_threshold <= self.digest_threshold <= self.urgent_threshold
-        ):
-            raise ValueError(
-                "Thresholds must satisfy archive <= digest <= urgent"
-            )
+        if not (self.archive_threshold <= self.digest_threshold <= self.urgent_threshold):
+            raise ValueError("Thresholds must satisfy archive <= digest <= urgent")
         try:
             ZoneInfo(self.timezone)
         except ZoneInfoNotFoundError as exc:
             raise ValueError(f"Unknown timezone: {self.timezone}") from exc
+        self.digest_schedule  # noqa: B018 - validates RADAR_DIGEST_TIMES early
         return self
+
+    @property
+    def zone(self) -> ZoneInfo:
+        return ZoneInfo(self.timezone)
+
+    @property
+    def digest_schedule(self) -> tuple[time, ...]:
+        try:
+            times = tuple(
+                sorted({time.fromisoformat(v.strip()) for v in self.digest_times.split(",")})
+            )
+        except ValueError as exc:
+            raise ValueError("RADAR_DIGEST_TIMES must look like 10:00,15:00,20:00") from exc
+        if not 2 <= len(times) <= 3:
+            raise ValueError("RADAR_DIGEST_TIMES must contain two or three different times")
+        return times
+
+    def production_problems(self) -> list[str]:
+        """What prevents `qmemo-radar run`. Empty means the configuration is complete."""
+        required = {
+            "RADAR_TELEGRAM_BOT_TOKEN": self.telegram_bot_token,
+            "RADAR_ALLOWED_TELEGRAM_ID": self.allowed_telegram_id,
+            "RADAR_X_BEARER_TOKEN": self.x_bearer_token,
+            "RADAR_LLM_BASE_URL": self.llm_base_url,
+            "RADAR_LLM_API_KEY": self.llm_api_key,
+            "RADAR_LLM_MODEL": self.llm_model,
+        }
+        problems = [f"{name} is required" for name, value in required.items() if not value]
+        # No real publisher exists yet, so enabling publishing must stop the service.
+        if self.qmemo_publishing_enabled:
+            problems.append("RADAR_QMEMO_PUBLISHING_ENABLED must stay false in this version")
+        if self.x_publishing_enabled:
+            problems.append("RADAR_X_PUBLISHING_ENABLED must stay false in this version")
+        if not self.sources_path.is_file():
+            problems.append(f"sources file not found: {self.sources_path}")
+        return problems
+
+    def secret_values(self) -> list[str]:
+        secrets = (self.telegram_bot_token, self.x_bearer_token, self.llm_api_key)
+        return [secret.get_secret_value() for secret in secrets if secret]
 
     def ensure_data_directory(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-
 
 
 class _SourcesModel(BaseModel):

@@ -18,10 +18,14 @@ from qmemo_radar.domain import (
     FactCheckStatus,
     FeedbackAction,
     OutboxStatus,
+    PipelineCounters,
+    PipelineRun,
     PublicationPackage,
+    RunStatus,
     ScoreBreakdown,
     ScoredEvent,
     ScoreResult,
+    SourceHealth,
 )
 
 _MIGRATIONS = "qmemo_radar.infrastructure.storage.migrations"
@@ -681,6 +685,97 @@ class SQLiteEventRepository:
                 "SELECT COUNT(*) FROM publication_outbox WHERE status = ?", (status.value,)
             )
         return int(count)
+
+    async def start_run(self, run_id: str) -> None:
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO pipeline_runs (id, started_at, status) VALUES (?, ?, ?)",
+                (run_id, datetime.now(UTC).isoformat(), RunStatus.RUNNING.value),
+            )
+            await db.commit()
+
+    async def finish_run(
+        self,
+        run_id: str,
+        status: RunStatus,
+        counters: PipelineCounters,
+        error_code: str | None,
+    ) -> None:
+        async with self._connect() as db:
+            await db.execute(
+                """
+                UPDATE pipeline_runs
+                SET finished_at = ?, status = ?, counters_json = ?, error_summary = ?
+                WHERE id = ?
+                """,
+                (
+                    datetime.now(UTC).isoformat(),
+                    status.value,
+                    counters.model_dump_json(),
+                    error_code,
+                    run_id,
+                ),
+            )
+            await db.commit()
+
+    async def fail_interrupted_runs(self) -> int:
+        async with self._connect() as db:
+            cursor = await db.execute(
+                """
+                UPDATE pipeline_runs SET status = ?, finished_at = ?, error_summary = 'interrupted'
+                WHERE status = ?
+                """,
+                (RunStatus.FAILED.value, datetime.now(UTC).isoformat(), RunStatus.RUNNING.value),
+            )
+            await db.commit()
+            return cursor.rowcount
+
+    async def last_run(self, statuses: set[RunStatus] | None = None) -> PipelineRun | None:
+        values = sorted(status.value for status in statuses or set(RunStatus))
+        async with self._connect() as db:
+            rows = list(
+                await db.execute_fetchall(
+                    f"""
+                    SELECT * FROM pipeline_runs WHERE status IN ({_placeholders(values)})
+                    ORDER BY started_at DESC LIMIT 1
+                    """,
+                    values,
+                )
+            )
+        if not rows:
+            return None
+        row = dict(rows[0])
+        return PipelineRun(
+            run_id=row["id"],
+            status=row["status"],
+            started_at=row["started_at"],
+            finished_at=row["finished_at"],
+            counters=PipelineCounters.model_validate_json(row["counters_json"]),
+            error_code=row["error_summary"],
+        )
+
+    async def counters_since(self, since: datetime) -> PipelineCounters:
+        async with self._connect() as db:
+            rows = await db.execute_fetchall(
+                "SELECT counters_json FROM pipeline_runs WHERE started_at >= ?",
+                (since.astimezone(UTC).isoformat(),),
+            )
+        total = PipelineCounters()
+        for (payload,) in rows:
+            counters = PipelineCounters.model_validate_json(payload)
+            for name in PipelineCounters.model_fields:
+                setattr(total, name, getattr(total, name) + getattr(counters, name))
+        return total
+
+    async def source_health(self) -> list[SourceHealth]:
+        async with self._connect() as db:
+            rows = await db.execute_fetchall(
+                "SELECT * FROM source_checkpoints ORDER BY source_key"
+            )
+        return [
+            SourceHealth.model_validate({k: v for k, v in dict(row).items() if k != "cursor_value"})
+            for row in rows
+        ]
 
     @classmethod
     def _scored_from_row(cls, row: aiosqlite.Row) -> ScoredEvent:

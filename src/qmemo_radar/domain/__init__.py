@@ -15,12 +15,14 @@ from qmemo_radar.domain.models import (
     Engagement,
     EventCandidate,
     PipelineCounters,
+    PipelineRun,
     PublicationPackage,
     RawSourceItem,
     ScoreBreakdown,
     ScoredEvent,
     ScoreResult,
     SourceFetch,
+    SourceHealth,
 )
 
 __all__ = [
@@ -36,6 +38,7 @@ __all__ = [
     "FeedbackAction",
     "OutboxStatus",
     "PipelineCounters",
+    "PipelineRun",
     "PublicationPackage",
     "RawSourceItem",
     "ScoreBreakdown",
@@ -43,6 +46,7 @@ __all__ = [
     "ScoredEvent",
     "ScoreResult",
     "SourceFetch",
+    "SourceHealth",
     "SourceType",
 ]
 

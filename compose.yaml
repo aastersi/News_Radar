@@ -1,11 +1,16 @@
 services:
   radar:
     build: .
+    image: qmemo-news-radar:local
     restart: unless-stopped
     env_file: .env
+    environment:
+      RADAR_DB_PATH: /app/data/radar.db
+      RADAR_SOURCES_PATH: /app/sources.yaml
     volumes:
       - radar_data:/app/data
+      - ./sources.yaml:/app/sources.yaml:ro
+    stop_grace_period: 30s
 
 volumes:
   radar_data:
-

@@ -9,6 +9,7 @@ from qmemo_radar.domain.enums import (
     EventStatus,
     FactCheckStatus,
     OutboxStatus,
+    RunStatus,
     SourceType,
 )
 
@@ -188,3 +189,20 @@ class Draft(DomainModel):
     model_name: str
     revision_instruction: str | None = None
     created_at: datetime
+
+
+class PipelineRun(DomainModel):
+    run_id: str
+    status: RunStatus
+    started_at: datetime
+    finished_at: datetime | None = None
+    counters: PipelineCounters
+    error_code: str | None = None
+
+
+class SourceHealth(DomainModel):
+    source_key: str
+    last_success_at: datetime | None = None
+    last_error_at: datetime | None = None
+    last_error: str | None = None
+    consecutive_failures: int = 0
