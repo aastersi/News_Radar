@@ -19,11 +19,15 @@ class SourceUnavailable(RadarError):
 
 
 class RankingFailed(RadarError):
-    """A ranking batch could not be scored with a valid structured result."""
+    """A ranking batch could not be scored with a valid structured result.
 
-    def __init__(self, code: str) -> None:
+    retryable=True means the provider was unreachable, not that the answer was invalid.
+    """
+
+    def __init__(self, code: str, *, retryable: bool = False) -> None:
         super().__init__(code)
         self.code = code
+        self.retryable = retryable
 
 
 class DeliveryFailed(RadarError):

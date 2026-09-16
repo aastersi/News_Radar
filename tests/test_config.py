@@ -13,4 +13,3 @@ def test_publishing_is_disabled_by_default() -> None:
     settings = RadarSettings(_env_file=None)
     assert settings.qmemo_publishing_enabled is False
     assert settings.x_publishing_enabled is False
-

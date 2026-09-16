@@ -29,6 +29,9 @@ _FIELDS = {
     "user.fields": "name,username",
 }
 _POST_ID = re.compile(r"[0-9]{1,19}")
+_X_EPOCH_MS = 1288834974657  # post ids are snowflakes: (id >> 22) + epoch = creation time in ms
+# Recent search only covers 7 days; an older since_id (a quiet account) would be rejected.
+SINCE_ID_MAX_AGE = timedelta(days=6)
 _HANDLE = re.compile(r"[A-Za-z0-9_]{1,15}")
 
 
@@ -68,7 +71,7 @@ class XApiClient:
         newest_id: str | None = None
         for _ in range(max_pages):
             body = await self._get("/2/tweets/search/recent", params, source_key)
-            meta = body.get("meta") or {}
+            meta = _mapping(body.get("meta"))
             # Results are newest first, so the first page carries the overall newest id.
             newest_id = newest_id or meta.get("newest_id")
             items.extend(_parse_posts(body, source_key))
@@ -76,6 +79,13 @@ class XApiClient:
             if not next_token:
                 break
             params["next_token"] = next_token
+        else:
+            # ponytail: posts past the page limit are skipped; raise max_pages_per_query or
+            # narrow the query if this warning repeats.
+            logger.warning(
+                "x results truncated by max_pages_per_query",
+                extra={"operation": "x_collect", "result": "truncated", "source_key": source_key},
+            )
         return items, newest_id
 
     async def lookup_post(self, post_id: str) -> RawSourceItem:
@@ -140,6 +150,8 @@ class XRecentSearchCollector:
         fetches: list[SourceFetch] = []
         for query in self._queries:
             since_id = checkpoints.get(query.source_key)
+            if since_id and not _is_recent_post_id(since_id, first_run_start):
+                since_id = None  # fall back to start_time for sources that were quiet for days
             try:
                 items, newest_id = await self._client.search_recent(
                     query.query,
@@ -170,18 +182,34 @@ class XRecentSearchCollector:
         return fetches
 
 
+def _mapping(value: object) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _sequence(value: object) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _is_recent_post_id(post_id: str, reference: datetime) -> bool:
+    if not _POST_ID.fullmatch(post_id):
+        return False
+    created = datetime.fromtimestamp(((int(post_id) >> 22) + _X_EPOCH_MS) / 1000, UTC)
+    return created > reference - SINCE_ID_MAX_AGE
+
+
 def _parse_posts(body: Mapping[str, Any], source_key: str) -> list[RawSourceItem]:
-    includes = body.get("includes") or {}
+    includes = _mapping(body.get("includes"))
     users = {
         user["id"]: user
-        for user in includes.get("users") or []
+        for user in _sequence(includes.get("users"))
         if isinstance(user, dict) and "id" in user
     }
+    posts = _sequence(body.get("data"))
     items: list[RawSourceItem] = []
-    for post in body.get("data") or []:
+    for post in posts:
         try:
             items.append(_parse_post(post, users, source_key))
-        except (KeyError, TypeError, ValueError, ValidationError):
+        except (AttributeError, KeyError, TypeError, ValueError, ValidationError):
             logger.warning(
                 "skipped malformed x post",
                 extra={"operation": "x_parse", "result": "skipped", "source_key": source_key},

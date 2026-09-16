@@ -144,7 +144,7 @@ class LlmRanker:
                 operation="rank",
             )
         except HttpFailure as exc:
-            raise RankingFailed(f"llm_{exc.code}") from exc
+            raise RankingFailed(f"llm_{exc.code}", retryable=True) from exc
         except ValueError as exc:
             raise RankingFailed("invalid_llm_output") from exc
 

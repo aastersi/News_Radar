@@ -14,15 +14,17 @@ EXPIRE_EVERY = timedelta(hours=1)
 HEARTBEAT_EVERY = timedelta(minutes=1)
 
 
-def seconds_until_next(now: datetime, times: Sequence[time], timezone: ZoneInfo) -> float:
-    """Seconds from `now` to the next configured local wall-clock time."""
-    local = now.astimezone(timezone)
-    upcoming = [
-        datetime.combine(local.date() + timedelta(days=day), moment, tzinfo=timezone)
-        for day in (0, 1)
+def next_occurrence(after: datetime, times: Sequence[time], timezone: ZoneInfo) -> datetime:
+    """The first configured local wall-clock time strictly after `after`, in UTC."""
+    moment_after = after.astimezone(UTC)
+    local_date = after.astimezone(timezone).date()
+    # Compare in UTC: subtracting two datetimes with the same ZoneInfo ignores DST shifts.
+    upcoming = (
+        datetime.combine(local_date + timedelta(days=day), moment, tzinfo=timezone).astimezone(UTC)
+        for day in (0, 1, 2)
         for moment in times
-    ]
-    return min((at - local).total_seconds() for at in upcoming if at > local)
+    )
+    return min(at for at in upcoming if at > moment_after)
 
 
 class RadarScheduler:
@@ -76,8 +78,11 @@ class RadarScheduler:
             await self._sleep(interval.total_seconds())
 
     async def _digests(self) -> None:
+        slot = self._clock()
         while True:
-            await self._sleep(seconds_until_next(self._clock(), self._digest_times, self._timezone))
+            # Always move past the previous slot, so an early wake-up cannot send it twice.
+            slot = next_occurrence(max(self._clock(), slot), self._digest_times, self._timezone)
+            await self._sleep(max(0.0, (slot - self._clock()).total_seconds()))
             await _safely("digest", self._digest)
 
 

@@ -4,6 +4,7 @@ from typing import Any
 
 import httpx
 import pytest
+from fakes import snowflake
 
 from qmemo_radar.application.filtering import FilterPolicy
 from qmemo_radar.application.normalization import parse_x_status_url
@@ -70,11 +71,12 @@ class Recorder:
         return XApiClient(http, sleep=self.sleep)
 
 
-def collector(recorder: Recorder, *queries: str) -> XRecentSearchCollector:
+def collector(recorder: Recorder, *queries: str, pages: int = 1) -> XRecentSearchCollector:
     return XRecentSearchCollector(
         recorder.client(),
         [XQuery(f"query:{name}", f"{name} -is:retweet") for name in queries or ("main",)],
         lookback=timedelta(minutes=60),
+        max_pages=pages,
     )
 
 
@@ -113,6 +115,7 @@ async def test_successful_search_parses_posts_and_requests_only_used_fields() ->
 
 
 async def test_pagination_follows_next_token_and_keeps_newest_id() -> None:
+    since = snowflake(minutes_ago=30)
     recorder = Recorder(
         httpx.Response(
             200, json=page([post("30", "newest post text"), post("29", "b")], next_token="t2")
@@ -120,24 +123,57 @@ async def test_pagination_follows_next_token_and_keeps_newest_id() -> None:
         httpx.Response(200, json=page([post("28", "older post text")])),
     )
 
-    [fetch] = await collector(recorder).collect({"query:main": "10"})
+    [fetch] = await collector(recorder, pages=3).collect({"query:main": since})
 
     assert [item.external_id for item in fetch.items] == ["30", "29", "28"]
     assert fetch.cursor == "30"
     assert "next_token" not in recorder.requests[0].url.params
     assert recorder.requests[1].url.params["next_token"] == "t2"
-    assert recorder.requests[1].url.params["since_id"] == "10"
+    assert recorder.requests[1].url.params["since_id"] == since
 
 
 async def test_since_id_replaces_start_time_and_empty_result_keeps_cursor() -> None:
+    since = snowflake(minutes_ago=90)
     recorder = Recorder(httpx.Response(200, json={"meta": {"result_count": 0}}))
 
-    [fetch] = await collector(recorder).collect({"query:main": "12345"})
+    [fetch] = await collector(recorder).collect({"query:main": since})
 
     params = recorder.requests[0].url.params
-    assert params["since_id"] == "12345"
+    assert params["since_id"] == since
     assert "start_time" not in params
-    assert fetch.items == () and fetch.cursor == "12345"
+    assert fetch.items == () and fetch.cursor == since
+
+
+async def test_since_id_older_than_the_search_window_falls_back_to_start_time() -> None:
+    stale = snowflake(minutes_ago=7 * 24 * 60)
+    recorder = Recorder(httpx.Response(200, json={"meta": {"result_count": 0}}))
+
+    await collector(recorder).collect({"query:main": stale})
+
+    params = recorder.requests[0].url.params
+    assert "since_id" not in params and "start_time" in params
+
+
+async def test_truncated_pages_are_reported(caplog: pytest.LogCaptureFixture) -> None:
+    body = page([post("9", "more pages exist")], next_token="t")
+    recorder = Recorder(httpx.Response(200, json=body))
+
+    [fetch] = await collector(recorder, pages=1).collect({})
+
+    assert len(recorder.requests) == 1 and fetch.cursor == "9"
+    assert any(getattr(r, "result", None) == "truncated" for r in caplog.records)
+
+
+async def test_malformed_shapes_do_not_break_the_source() -> None:
+    bad_note = post("8", "note is not an object")
+    bad_note["note_tweet"] = "oops"
+    body = {"data": [bad_note, post("7", "fine post text here")], "includes": [], "meta": "x"}
+    recorder = Recorder(httpx.Response(200, json=body))
+
+    [fetch] = await collector(recorder).collect({})
+
+    assert fetch.error_code is None
+    assert [item.external_id for item in fetch.items] == ["7"]
 
 
 async def test_429_waits_for_retry_after_then_succeeds() -> None:
@@ -266,8 +302,9 @@ async def test_one_failed_query_does_not_stop_others(repository: SQLiteEventRepo
 async def test_repeated_run_uses_checkpoint_and_creates_no_duplicates(
     repository: SQLiteEventRepository,
 ) -> None:
+    post_id = snowflake(minutes_ago=5)
     recorder = Recorder(
-        httpx.Response(200, json=page([post("90", "Founder said the market will double")]))
+        httpx.Response(200, json=page([post(post_id, "Founder said the market will double")]))
     )
     source = collector(recorder)
 
@@ -276,7 +313,7 @@ async def test_repeated_run_uses_checkpoint_and_creates_no_duplicates(
 
     assert first.inserted == 1
     assert second.inserted == 0 and second.duplicates == 1
-    assert recorder.requests[1].url.params["since_id"] == "90"
+    assert recorder.requests[1].url.params["since_id"] == post_id
     assert sum((await repository.count_by_status()).values()) == 1
 
 

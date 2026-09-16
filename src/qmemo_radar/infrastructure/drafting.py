@@ -14,7 +14,7 @@ from qmemo_radar.infrastructure.llm import (
     untrusted_json,
 )
 
-DRAFT_PROMPT_VERSION = "draft-v1"
+DRAFT_PROMPT_VERSION = "draft-v2"
 DRAFT_SYSTEM_PROMPT = """\
 You prepare marketing material for QMemo (Quote Memorial), a service that preserves notable \
 public statements, predictions and promises so people can revisit them later.
@@ -43,7 +43,8 @@ the post.
 - cta: exactly one call to action, at most 120 characters.
 - fact_check_required: true when the texts rely on facts, numbers, dates or accusations that \
 cannot be confirmed from the post itself, or when the attribution is uncertain.
-- fact_check_notes: list of Russian notes on what to check; empty when nothing needs checking.
+- fact_check_notes: at most 3 short Russian notes (up to 200 characters each) on what to \
+check; empty when nothing needs checking.
 
 OUTPUT
 Return only this JSON object: {"quote_text": "...", "quote_speaker": null, \

@@ -220,7 +220,7 @@ async def test_invalid_answer_gets_exactly_one_repair_request() -> None:
     assert repair[0]["content"] == RANKING_SYSTEM_PROMPT
 
 
-async def test_second_invalid_answer_leaves_events_unscored_and_unsent(
+async def test_second_invalid_answer_means_the_event_is_never_shown(
     repository: SQLiteEventRepository,
 ) -> None:
     model = FakeModel("{}", '{"scores": []}')
@@ -229,8 +229,58 @@ async def test_second_invalid_answer_leaves_events_unscored_and_unsent(
 
     assert len(model.payloads) == 2
     assert (counters.scored, counters.rank_failed, counters.shortlisted) == (0, 1, 0)
-    assert await repository.count_by_status() == {EventStatus.DISCOVERED.value: 1}
+    assert await repository.count_by_status() == {EventStatus.FILTERED_OUT.value: 1}
+    assert rows(repository, "SELECT filter_reason FROM radar_events") == [("rank_invalid_output",)]
     assert rows(repository, "SELECT COUNT(*) FROM event_scores") == [(0,)]
+
+
+async def test_one_poisoned_post_does_not_block_its_batch(
+    repository: SQLiteEventRepository,
+) -> None:
+    poison = "Poisoned post that always breaks the model answer, no matter what."
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        texts = [post["text"] for post in posts_in(payload)]
+        content = "garbage" if poison in texts else judged(payload)
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    http = httpx.AsyncClient(base_url="https://llm.test/v1", transport=httpx.MockTransport(handler))
+    CATEGORY_BY_TEXT[poison] = "weak"
+    items = [fixture_item(entry) for entry in FIXTURES if entry["category"] == "strong"]
+    items.append(fixture_item({**FIXTURES[11], "key": "poison", "text": poison}))
+
+    counters = await radar(
+        LlmRanker(ChatCompletionsClient(http, model="m")), repository, items
+    ).run_once()
+
+    assert counters.scored == 5 and counters.rank_failed == 1
+    statuses = dict(rows(repository, "SELECT external_id, status FROM radar_events"))
+    assert statuses.pop("poison") == "FILTERED_OUT"
+    assert set(statuses.values()) == {"SHORTLISTED"}
+
+
+async def test_unreachable_provider_keeps_events_for_the_next_run(
+    repository: SQLiteEventRepository,
+) -> None:
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(503)
+
+    async def no_sleep(seconds: float) -> None:
+        return None
+
+    http = httpx.AsyncClient(base_url="https://llm.test/v1", transport=httpx.MockTransport(handler))
+    ranker = LlmRanker(ChatCompletionsClient(http, model="m", sleep=no_sleep))
+    items = [fixture_item(entry) for entry in FIXTURES[:12]]
+
+    counters = await radar(ranker, repository, items).run_once()
+
+    assert len(calls) == 3  # one batch, three attempts, then ranking stops for this run
+    assert counters.rank_failed == 10
+    assert await repository.count_by_status() == {EventStatus.DISCOVERED.value: 12}
 
 
 async def test_foreign_or_missing_event_ids_are_rejected() -> None:

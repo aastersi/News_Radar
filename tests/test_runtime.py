@@ -4,6 +4,7 @@ import logging
 import re
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 from collections.abc import Mapping
@@ -26,7 +27,7 @@ from pydantic import SecretStr
 
 from qmemo_radar.application.ports import SourceCollector
 from qmemo_radar.application.runner import HEARTBEAT_KEY
-from qmemo_radar.application.scheduler import RadarScheduler, seconds_until_next
+from qmemo_radar.application.scheduler import RadarScheduler, next_occurrence
 from qmemo_radar.bootstrap import (
     Application,
     JsonLogFormatter,
@@ -165,10 +166,21 @@ def test_next_digest_time_uses_the_configured_local_schedule() -> None:
     zone = ZoneInfo("Asia/Ho_Chi_Minh")  # UTC+7
     times = [time(10), time(15), time(20)]
 
-    assert seconds_until_next(datetime(2026, 9, 16, 2, 0, tzinfo=UTC), times, zone) == 3600
-    assert seconds_until_next(datetime(2026, 9, 16, 3, 0, tzinfo=UTC), times, zone) == 5 * 3600
-    late = datetime(2026, 9, 16, 13, 30, tzinfo=UTC)  # 20:30 local
-    assert seconds_until_next(late, times, zone) == 13.5 * 3600
+    def utc(day: int, hour: int, minute: int = 0) -> datetime:
+        return datetime(2026, 9, day, hour, minute, tzinfo=UTC)
+
+    assert next_occurrence(utc(16, 2), times, zone) == utc(16, 3)
+    assert next_occurrence(utc(16, 3), times, zone) == utc(16, 8)  # strictly after the slot
+    assert next_occurrence(utc(16, 13, 30), times, zone) == utc(17, 3)
+
+
+def test_digest_schedule_survives_daylight_saving_changes() -> None:
+    berlin = ZoneInfo("Europe/Berlin")  # clocks jump from 02:00 to 03:00 on 2026-03-29
+    before_jump = datetime(2026, 3, 29, 0, 30, tzinfo=berlin)
+
+    at = next_occurrence(before_jump, [time(9)], berlin)
+
+    assert at == datetime(2026, 3, 29, 7, 0, tzinfo=UTC)  # 09:00 CEST
 
 
 async def test_scheduler_runs_collection_expiry_and_heartbeat_then_stops(
@@ -220,6 +232,71 @@ async def test_serve_stops_on_signal_event_and_cancels_jobs() -> None:
     await asyncio.wait_for(runner, 1)
 
     assert sorted(cleaned) == ["poller", "scheduler"]
+
+
+async def test_serve_lets_polling_stop_gracefully_before_cancelling() -> None:
+    stop = asyncio.Event()
+    polling_stopped = asyncio.Event()
+    order: list[str] = []
+
+    async def poller() -> None:
+        await polling_stopped.wait()
+        order.append("poller finished by itself")
+
+    async def scheduler() -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            order.append("scheduler cancelled")
+
+    async def stop_polling() -> None:
+        polling_stopped.set()
+        await asyncio.sleep(0.01)
+        order.append("stop_polling returned")
+
+    runner = asyncio.create_task(serve([scheduler, poller], stop, on_stop=stop_polling))
+    await asyncio.sleep(0.01)
+    stop.set()
+    await asyncio.wait_for(runner, 1)
+
+    assert order == ["poller finished by itself", "stop_polling returned", "scheduler cancelled"]
+
+
+async def test_dispatcher_shutdown_waits_for_started_handlers() -> None:
+    from aiogram import Bot
+    from aiogram.types import Chat, Message, Update, User
+
+    from qmemo_radar.interfaces.telegram.bot import build_dispatcher
+
+    release = asyncio.Event()
+    handled: list[str] = []
+
+    class SlowController:
+        async def handle_message(self, user_id: int | None, text: str, send: object) -> None:
+            await release.wait()
+            handled.append(text)
+
+    dispatcher = build_dispatcher(SlowController())  # type: ignore[arg-type]
+    bot = Bot("123456:TEST")
+    message = Message(
+        message_id=1,
+        date=datetime.now(UTC),
+        chat=Chat(id=OWNER_ID, type="private"),
+        from_user=User(id=OWNER_ID, is_bot=False, first_name="Owner"),
+        text="/run",
+    )
+    handler = asyncio.create_task(dispatcher.feed_update(bot, Update(update_id=1, message=message)))
+    await asyncio.sleep(0.01)
+
+    shutdown = asyncio.create_task(dispatcher.emit_shutdown(bot=bot))
+    await asyncio.sleep(0.01)
+    assert not shutdown.done()
+    release.set()
+    await asyncio.wait_for(shutdown, 1)
+    await handler
+    await bot.session.close()
+
+    assert handled == ["/run"]
 
 
 async def test_serve_fails_when_a_job_dies() -> None:
@@ -408,3 +485,83 @@ asyncio.run(main())
     assert process.returncode == 0
     assert "closed scheduler" in output and "closed poller" in output
     assert output.strip().endswith("shutdown complete")
+
+
+async def test_manual_link_revives_an_archived_post(repository: SQLiteEventRepository) -> None:
+    plain = x_item(5, "A calm update about a routine product meeting held this afternoon.")
+    await services(repository, FakeCollector([plain])).runner.run_cycle(manual=False)
+    with sqlite3.connect(repository._db_path) as db:  # as if it had scored below the threshold
+        db.execute("UPDATE radar_events SET status = 'ARCHIVED'")
+    assert await repository.count_by_status() == {EventStatus.ARCHIVED.value: 1}
+    gateway = FakeGateway()
+    bot = telegram(repository, gateway, lookup=FakeLookup(plain))
+    inbox = Inbox()
+
+    await bot.handle_message(OWNER_ID, "https://x.com/founder/status/1005", inbox)
+    await bot.handle_message(OWNER_ID, "/run", inbox)
+
+    assert inbox.replies[0].text == "Ссылка добавлена. Она будет оценена при следующем сборе."
+    assert [card.event.external_id for card, _, _ in gateway.cards] == ["1005"]
+
+
+async def test_undeliverable_card_does_not_block_the_rest(
+    repository: SQLiteEventRepository,
+) -> None:
+    from fakes import review_service, seed
+
+    gateway = FakeGateway()
+    gateway.rejected_external_ids = {"1001"}
+    await seed(repository, x_item(1), x_item(2))
+
+    sent = await review_service(repository, gateway).deliver(urgent=False)
+
+    assert sent == 1 and gateway.cards[0][0].event.external_id == "1002"
+    assert await repository.count_by_status() == {
+        EventStatus.SHORTLISTED.value: 1,
+        EventStatus.NOTIFIED.value: 1,
+    }
+
+
+async def test_expiry_during_ranking_does_not_fail_the_cycle(
+    repository: SQLiteEventRepository,
+) -> None:
+    class ExpiringRanker(DeterministicFixtureRanker):
+        async def rank(self, events):  # type: ignore[no-untyped-def]
+            results = await super().rank(events)
+            await repository.expire_events(datetime.now(UTC) + timedelta(hours=1))
+            return results
+
+    radar = build_services(
+        Application(settings=settings_for(repository), repository=repository),
+        collector=FakeCollector([x_item(1)]),
+        ranker=ExpiringRanker(),
+        writer=DeterministicDraftWriter(),
+        gateway=FakeGateway(),
+        lookup=None,
+        sources=SourcesConfig(),
+    )
+
+    result = await radar.runner.run_cycle(manual=True)
+
+    assert result.status is RunStatus.SUCCESS
+    assert await repository.count_by_status() == {EventStatus.EXPIRED.value: 1}
+
+
+async def test_link_like_text_is_never_used_as_a_revision_instruction(
+    repository: SQLiteEventRepository,
+) -> None:
+    from fakes import review_service, seed
+
+    gateway = FakeGateway()
+    await seed(repository, x_item(1))
+    await review_service(repository, gateway).deliver(urgent=False)
+    bot = telegram(repository, gateway)
+    inbox = Inbox()
+    await bot.handle_callback(OWNER_ID, f"e:use:{gateway.cards[0][0].event.event_id}", inbox)
+
+    await bot.handle_message(OWNER_ID, "https://twitter.com/founder/status/123", inbox)
+    await bot.handle_message(OWNER_ID, "see x.com/founder/status/1", inbox)
+
+    assert inbox.replies[-1].text == "Нужна ссылка вида https://x.com/имя/status/123."
+    assert inbox.replies[-2].text == inbox.replies[-1].text
+    assert await repository.latest_revisable_draft() is not None

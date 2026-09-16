@@ -93,7 +93,7 @@ class ReviewService:
                         "card delivery failed",
                         extra={**log, "result": "failed", "error_code": exc.code},
                     )
-                    break
+                    continue
                 if await self._repository.record_delivery(
                     card.event.event_id,
                     chat_id=self._chat_id,
@@ -149,7 +149,9 @@ class ReviewService:
             return Outcome.UNAVAILABLE
         event = build_candidate(item.model_copy(update={"source_key": MANUAL_SOURCE_KEY}))
         if not await self._repository.add_event(event):
-            return Outcome.ALREADY_DECIDED
+            # Known post: a person's pick overrides an earlier archive or filter decision.
+            if not await self._repository.requeue_manual(event):
+                return Outcome.ALREADY_DECIDED
         logger.info(
             "manual link queued",
             extra={"event_id": event.event_id, "operation": "manual_link", "result": "queued"},

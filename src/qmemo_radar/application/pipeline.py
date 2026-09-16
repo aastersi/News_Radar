@@ -100,45 +100,74 @@ class RadarPipeline:
             candidates.append(event)
 
         for batch in _batches(candidates, size=10):
-            try:
-                by_id = _validate_results(batch, await self._ranker.rank(batch))
-            except RankingFailed as exc:
-                # Unscored events stay DISCOVERED: they are never shown and are retried next run.
-                counters.rank_failed += len(batch)
-                logger.warning(
-                    "ranking batch failed",
-                    extra={
-                        "run_id": run_id,
-                        "operation": "rank",
-                        "result": f"failed_batch={len(batch)}",
-                        "error_code": exc.code,
-                    },
-                )
-                continue
-            for event in batch:
-                score = by_id[event.event_id]
-                next_status = (
-                    EventStatus.SHORTLISTED  # a manual link was chosen by a person
-                    if event.source_key == MANUAL_SOURCE_KEY
-                    else self._status_for_score(score.total)
-                )
-                await self._repository.save_score_and_status(score, next_status)
-                logger.info(
-                    "event scored",
-                    extra={
-                        "run_id": run_id,
-                        "event_id": event.event_id,
-                        "operation": "rank",
-                        "result": f"{next_status.value}:{score.total}",
-                    },
-                )
-                counters.scored += 1
-                if next_status is EventStatus.SHORTLISTED:
-                    counters.shortlisted += 1
-                else:
-                    counters.archived += 1
+            if not await self._rank(batch, counters, run_id):
+                break
 
         return counters
+
+    async def _rank(
+        self,
+        batch: list[EventCandidate],
+        counters: PipelineCounters,
+        run_id: str | None,
+    ) -> bool:
+        """Score one batch. Returns False when the provider is down and ranking should stop."""
+        try:
+            by_id = _validate_results(batch, await self._ranker.rank(batch))
+        except RankingFailed as exc:
+            logger.warning(
+                "ranking batch failed",
+                extra={
+                    "run_id": run_id,
+                    "operation": "rank",
+                    "result": f"failed_batch={len(batch)}",
+                    "error_code": exc.code,
+                },
+            )
+            if exc.retryable:
+                # Provider unreachable: events stay DISCOVERED and are retried next run.
+                counters.rank_failed += len(batch)
+                return False
+            if len(batch) > 1:
+                # One bad post must not block its neighbours: rank them one by one.
+                for event in batch:
+                    if not await self._rank([event], counters, run_id):
+                        return False
+                return True
+            # This single post keeps producing invalid answers: never show it, never retry it.
+            counters.rank_failed += 1
+            await self._repository.set_status(
+                batch[0].event_id,
+                EventStatus.FILTERED_OUT,
+                expected={EventStatus.DISCOVERED},
+                filter_reason="rank_invalid_output",
+            )
+            return True
+
+        for event in batch:
+            score = by_id[event.event_id]
+            next_status = (
+                EventStatus.SHORTLISTED  # a manual link was chosen by a person
+                if event.source_key == MANUAL_SOURCE_KEY
+                else self._status_for_score(score.total)
+            )
+            if not await self._repository.save_score_and_status(score, next_status):
+                continue  # expired or otherwise moved on while it was being ranked
+            logger.info(
+                "event scored",
+                extra={
+                    "run_id": run_id,
+                    "event_id": event.event_id,
+                    "operation": "rank",
+                    "result": f"{next_status.value}:{score.total}",
+                },
+            )
+            counters.scored += 1
+            if next_status is EventStatus.SHORTLISTED:
+                counters.shortlisted += 1
+            else:
+                counters.archived += 1
+        return True
 
     def _status_for_score(self, total: int) -> EventStatus:
         if total >= self._thresholds.digest:

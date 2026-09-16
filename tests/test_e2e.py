@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fakes import OWNER_ID, TIMEZONE, FakeGateway, Inbox, settings_for
+from fakes import OWNER_ID, TIMEZONE, FakeGateway, Inbox, settings_for, snowflake
 
 from qmemo_radar.bootstrap import Application, Services, build_services, build_x_collector
 from qmemo_radar.config import SourcesConfig
@@ -80,8 +80,8 @@ class FakeLlm:
         payload = json.loads(request.content)
         system, user = payload["messages"][0]["content"], payload["messages"][1]["content"]
         if self.broken:
-            content = "I cannot help with that."
-        elif system == RANKING_SYSTEM_PROMPT:
+            return httpx.Response(503)
+        if system == RANKING_SYSTEM_PROMPT:
             content = json.dumps({"scores": [_score(post) for post in _block(user, "posts")]})
         else:
             assert system == DRAFT_SYSTEM_PROMPT
@@ -130,6 +130,10 @@ def _draft(post: dict[str, Any], *, revision: bool) -> dict[str, Any]:
     }
 
 
+async def _no_sleep(seconds: float) -> None:
+    return None
+
+
 class Radar:
     """A freshly started process: new repository, clients and services on the same database."""
 
@@ -146,6 +150,7 @@ class Radar:
                 base_url="https://llm.test/v1", transport=httpx.MockTransport(llm.handler)
             ),
             model="e2e-model",
+            sleep=_no_sleep,
         )
         app = Application(settings=settings_for(self.repository), repository=self.repository)
         self.services: Services = build_services(
@@ -178,11 +183,15 @@ class Radar:
 
 async def test_full_path_from_x_to_outbox_survives_restart(tmp_path: Path) -> None:
     x, llm = FakeX(), FakeLlm()
-    x.posts["from:mara_quinn"] = [x_post("200", URGENT)]
+    urgent_id, digest_id = snowflake(4, minutes_ago=5), snowflake(3, minutes_ago=6)
+    x.posts["from:mara_quinn"] = [x_post(urgent_id, URGENT)]
     x.posts["predicts"] = [
-        x_post("150", DIGEST),
-        x_post("140", "Giveaway! Follow and repost to win a free Orbitra hoodie today."),
-        x_post("130", 'Mara Quinn: "Offices on every continent."', minutes_ago=300),
+        x_post(digest_id, DIGEST),
+        x_post(
+            snowflake(2, minutes_ago=7),
+            "Giveaway! Follow and repost to win a free Orbitra hoodie today.",
+        ),
+        x_post(snowflake(1, minutes_ago=300), 'Mara Quinn: "Offices on every continent."', 300),
     ]
     radar = await Radar(tmp_path / "radar.db", x, llm).start()
 
@@ -190,15 +199,15 @@ async def test_full_path_from_x_to_outbox_survives_restart(tmp_path: Path) -> No
     await radar.bot.handle_message(OWNER_ID, "/run", radar.inbox)
     assert "SUCCESS" in radar.inbox.last.text
     [(card, urgent, _)] = radar.gateway.cards
-    assert urgent and card.event.external_id == "200" and card.score.total == 94
+    assert urgent and card.event.external_id == urgent_id and card.score.total == 94
     card_text = render.card_text(card, timezone=TIMEZONE, urgent=True)
     assert "Прогноз Orbitra" in card_text and "Балл: <b>94</b>" in card_text
-    reasons = dict(radar.rows("SELECT external_id, filter_reason FROM radar_events"))
-    assert reasons == {"200": None, "150": None, "140": "blocked_term", "130": "too_old"}
+    reasons = sorted(radar.rows("SELECT filter_reason FROM radar_events"), key=str)
+    assert reasons == [("blocked_term",), ("too_old",), (None,), (None,)]
 
     # digest -> second card
     assert await radar.services.review.deliver(urgent=False) == 1
-    assert radar.gateway.cards[1][0].event.external_id == "150"
+    assert radar.gateway.cards[1][0].event.external_id == digest_id
 
     # Telegram -> draft -> one revision -> approval -> outbox
     await radar.bot.handle_callback(OWNER_ID, f"e:use:{card.event.event_id}", radar.inbox)
@@ -218,7 +227,7 @@ async def test_full_path_from_x_to_outbox_survives_restart(tmp_path: Path) -> No
         package.quote_text
         == "Every Orbitra wallet will run on solar nodes by 2027. Hold me to that."
     )
-    assert package.source_external_id == "200" and package.draft_id == second.draft_id
+    assert package.source_external_id == urgent_id and package.draft_id == second.draft_id
 
     # Only read-only X calls and LLM completions happened; nothing was published anywhere.
     assert {(r.method, r.url.host, r.url.path) for r in x.requests} == {
@@ -235,8 +244,8 @@ async def test_full_path_from_x_to_outbox_survives_restart(tmp_path: Path) -> No
 
     since = {r.url.params["query"]: r.url.params.get("since_id") for r in x.requests}
     assert since == {
-        "from:mara_quinn -is:retweet": "200",
-        "(predicts OR promises) -is:retweet": "150",
+        "from:mara_quinn -is:retweet": urgent_id,
+        "(predicts OR promises) -is:retweet": digest_id,
     }
     assert restarted.gateway.cards == []
     assert restarted.rows("SELECT COUNT(*) FROM radar_events") == [(4,)]
@@ -268,7 +277,8 @@ async def test_full_path_from_x_to_outbox_survives_restart(tmp_path: Path) -> No
 
 async def test_unranked_events_are_picked_up_after_restart(tmp_path: Path) -> None:
     x, llm = FakeX(), FakeLlm()
-    x.posts["from:mara_quinn"] = [x_post("300", URGENT)]
+    post_id = snowflake(minutes_ago=5)
+    x.posts["from:mara_quinn"] = [x_post(post_id, URGENT)]
     llm.broken = True
     crashed = await Radar(tmp_path / "radar.db", x, llm).start()
 
@@ -283,7 +293,7 @@ async def test_unranked_events_are_picked_up_after_restart(tmp_path: Path) -> No
     restarted = await Radar(tmp_path / "radar.db", x, llm).start()
     await restarted.bot.handle_message(OWNER_ID, "/run", restarted.inbox)
 
-    assert [card.event.external_id for card, _, _ in restarted.gateway.cards] == ["300"]
+    assert [card.event.external_id for card, _, _ in restarted.gateway.cards] == [post_id]
     assert restarted.rows(
         "SELECT status, error_summary FROM pipeline_runs WHERE id = 'killed-before-finish'"
     ) == [("FAILED", "interrupted")]

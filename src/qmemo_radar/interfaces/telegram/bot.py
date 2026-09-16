@@ -1,7 +1,10 @@
 """aiogram glue: turns updates into controller calls and sends replies. No decisions here."""
 
+import asyncio
 import logging
 from collections.abc import Awaitable
+from contextlib import suppress
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, Router
@@ -24,6 +27,8 @@ from qmemo_radar.interfaces.telegram.render import Keyboard
 
 logger = logging.getLogger(__name__)
 
+HANDLER_DRAIN_SECONDS = 20
+
 BOT_COMMANDS = [
     BotCommand(command="today", description="Карточки за сегодня"),
     BotCommand(command="saved", description="Отложенные и одобренные"),
@@ -43,24 +48,41 @@ def build_bot(token: str) -> Bot:
 
 def build_dispatcher(controller: TelegramController) -> Dispatcher:
     router = Router()
+    in_flight: set[asyncio.Task[Any]] = set()
+
+    async def tracked(handling: Awaitable[None], send: Send) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            in_flight.add(task)
+        try:
+            await _guarded(handling, send)
+        finally:
+            in_flight.discard(task)
 
     @router.message()
     async def on_message(message: Message, bot: Bot) -> None:
         user_id = message.from_user.id if message.from_user else None
         send = _sender(bot, message.chat.id)
-        await _guarded(controller.handle_message(user_id, message.text or "", send), send)
+        await tracked(controller.handle_message(user_id, message.text or "", send), send)
 
     @router.callback_query()
     async def on_callback(callback: CallbackQuery, bot: Bot) -> None:
-        await callback.answer()
+        with suppress(TelegramAPIError):  # e.g. "query is too old" after a restart
+            await callback.answer()
         chat_id = callback.message.chat.id if callback.message else callback.from_user.id
         send = _sender(bot, chat_id)
-        await _guarded(
+        await tracked(
             controller.handle_callback(callback.from_user.id, callback.data or "", send), send
         )
 
+    async def drain_handlers() -> None:
+        """Runs when polling stops: let started drafts, approvals and /run finish."""
+        if in_flight:
+            await asyncio.wait(set(in_flight), timeout=HANDLER_DRAIN_SECONDS)
+
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
+    dispatcher.shutdown.register(drain_handlers)
     return dispatcher
 
 
@@ -120,6 +142,8 @@ async def _guarded(handling: Awaitable[None], send: Send) -> None:
 
 
 async def prepare_bot(bot: Bot) -> None:
+    # Long polling cannot receive updates while a webhook is set on this project's bot.
+    await bot.delete_webhook(drop_pending_updates=False)
     try:
         await bot.set_my_commands(BOT_COMMANDS)
     except TelegramAPIError as exc:

@@ -22,6 +22,13 @@ from qmemo_radar.interfaces.telegram.controller import Reply, TelegramController
 
 OWNER_ID = 424242
 TIMEZONE = ZoneInfo("Asia/Ho_Chi_Minh")
+X_EPOCH_MS = 1288834974657
+
+
+def snowflake(sequence: int = 0, *, minutes_ago: float = 0) -> str:
+    """A post id whose embedded timestamp is `minutes_ago` minutes in the past."""
+    created_ms = int((datetime.now(UTC) - timedelta(minutes=minutes_ago)).timestamp() * 1000)
+    return str(((created_ms - X_EPOCH_MS) << 22) + sequence)
 
 
 class FakeGateway:
@@ -32,8 +39,11 @@ class FakeGateway:
     def __init__(self) -> None:
         self.cards: list[tuple[ScoredEvent, bool, int]] = []
         self.fail = False
+        self.rejected_external_ids: set[str] = set()
 
     async def send_card(self, card: ScoredEvent, *, urgent: bool) -> int:
+        if card.event.external_id in self.rejected_external_ids:
+            raise DeliveryFailed("TelegramBadRequest")
         if self.fail:
             raise DeliveryFailed("TelegramNetworkError")
         message_id = next(self._message_ids)

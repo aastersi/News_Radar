@@ -144,7 +144,6 @@ class PipelineCounters(BaseModel):
     rank_failed: int = 0
 
 
-
 class ScoredEvent(DomainModel):
     event: EventCandidate
     score: ScoreResult
@@ -153,16 +152,18 @@ class ScoredEvent(DomainModel):
 class DraftText(DomainModel):
     """What a draft writer produces for one event. Checked against the source before use."""
 
-    quote_text: str = Field(min_length=3, max_length=600)
+    quote_text: str = Field(min_length=3, max_length=500)
     quote_speaker: str | None = Field(default=None, max_length=120)
-    context_summary: str = Field(min_length=1, max_length=500)
-    qmemo_text: str = Field(min_length=1, max_length=700)
+    context_summary: str = Field(min_length=1, max_length=400)
+    qmemo_text: str = Field(min_length=1, max_length=600)
     x_text_template: XTextTemplate
-    x_text_short: str = Field(min_length=1, max_length=200)
-    angle: str = Field(min_length=1, max_length=200)
-    cta: str = Field(min_length=1, max_length=160)
+    x_text_short: str = Field(min_length=1, max_length=160)
+    angle: str = Field(min_length=1, max_length=150)
+    cta: str = Field(min_length=1, max_length=120)
     fact_check_required: bool
-    fact_check_notes: tuple[str, ...] = ()
+    fact_check_notes: tuple[Annotated[str, Field(max_length=200)], ...] = Field(
+        default=(), max_length=3
+    )
     prompt_version: str = "deterministic-v1"
     model_name: str = "none"
 

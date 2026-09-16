@@ -16,4 +16,3 @@ def test_score_is_recomputed_and_clamped() -> None:
 
     assert calculate_total(maximum) == 100
     assert calculate_total(risky) == 40
-

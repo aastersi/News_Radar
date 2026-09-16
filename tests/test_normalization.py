@@ -19,4 +19,3 @@ def test_normalization_keeps_original_and_canonicalizes_url() -> None:
     assert event.normalized_text == "a quoted statement"
     assert str(event.url) == "https://x.com/alice/status/1"
     assert len(event.content_hash) == 64
-

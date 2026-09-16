@@ -21,6 +21,7 @@ from qmemo_radar.interfaces.telegram.render import Keyboard
 logger = logging.getLogger(__name__)
 
 _ITEM_ID = re.compile(r"[0-9a-f]{32}")
+_LOOKS_LIKE_LINK = re.compile(r"https?://|(?:^|\s)(?:www\.)?(?:x|twitter)\.com/", re.IGNORECASE)
 _DECIDED = "Решение по этому событию уже принято, кнопка больше не действует."
 _NOT_FOUND = "Событие не найдено."
 _STALE_BUTTON = "Кнопка устарела."
@@ -88,6 +89,8 @@ class TelegramController:
             await send(Reply(f"Radar {state}."))
         elif parse_x_status_url(text):
             await send(Reply(_link_reply(await self._review.submit_link(text))))
+        elif _LOOKS_LIKE_LINK.search(text):
+            await send(Reply(_link_reply(Outcome.INVALID)))
         elif command.startswith("/") or not command:
             await send(Reply(render.HELP_TEXT))
         else:
@@ -136,7 +139,9 @@ class TelegramController:
         if draft is None:
             await send(Reply(render.HELP_TEXT))
             return
-        await send(Reply("⏳ Переделываю по вашей инструкции…"))
+        card = await self._review.explain(draft.event_id)
+        title = render.esc(card.score.headline) if card else ""
+        await send(Reply(f"⏳ Переделываю черновик по вашей инструкции: {title}"))
         result = await self._drafts.revise(
             draft.draft_id, self._allowed_user_id, RevisionMode.CUSTOM, text[:500]
         )

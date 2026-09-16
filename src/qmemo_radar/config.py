@@ -37,7 +37,7 @@ class RadarSettings(BaseSettings):
     collect_interval_minutes: int = Field(default=30, ge=5, le=1440)
     max_event_age_minutes: int = Field(default=60, ge=5, le=10080)
     daily_card_limit: int = Field(default=10, ge=1, le=50)
-    digest_card_limit: int = Field(default=5, ge=1, le=10)
+    digest_card_limit: int = Field(default=5, ge=1, le=5)
     digest_times: str = "10:00,15:00,20:00"
     urgent_threshold: int = Field(default=80, ge=0, le=100)
     digest_threshold: int = Field(default=65, ge=0, le=100)

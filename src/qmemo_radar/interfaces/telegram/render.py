@@ -127,7 +127,8 @@ def draft_text(draft: Draft, card: ScoredEvent) -> str:
         f"<b>Призыв:</b> {esc(draft.cta)}",
         "<b>Проверка фактов:</b> " + ("✅ проверено" if verified else "⚠️ требуется проверка"),
     ]
-    lines += [f"• {esc(note)}" for note in draft.fact_check_notes]
+    # Clipped so the message stays under Telegram's 4096 characters.
+    lines += [f"• {esc(note[:200])}" for note in draft.fact_check_notes[:4]]
     lines += [
         f"Переделок осталось: {MAX_DRAFT_VERSIONS - draft.version}",
         "<i>{qmemo_url} будет заменён реальной ссылкой QMemo. Публикация выключена.</i>",
@@ -290,7 +291,7 @@ def _llm_state(counters: PipelineCounters | None) -> str:
     if counters is None or not (counters.scored or counters.rank_failed):
         return "в последнем сборе не вызывалась"
     if counters.rank_failed:
-        return f"ошибка оценки, {counters.rank_failed} событий будут оценены повторно"
+        return f"ошибка оценки в последнем сборе: {counters.rank_failed} событий не оценены"
     return "в порядке"
 
 

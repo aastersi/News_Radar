@@ -157,7 +157,7 @@ class SQLiteEventRepository:
         self,
         score: ScoreResult,
         status: EventStatus,
-    ) -> None:
+    ) -> bool:
         now = datetime.now(UTC).isoformat()
         breakdown = score.breakdown
         async with self._connect() as db:
@@ -227,10 +227,10 @@ class SQLiteEventRepository:
                 ),
             )
             if cursor.rowcount != 1:
-                raise RuntimeError(
-                    f"Event {score.event_id} is not in DISCOVERED state"
-                )
+                await db.rollback()
+                return False
             await db.commit()
+            return True
 
     async def count_by_status(self) -> dict[str, int]:
         async with self._connect() as db:
@@ -429,6 +429,29 @@ class SQLiteEventRepository:
             )
             await db.commit()
             return cursor.rowcount
+
+    async def requeue_manual(self, event: EventCandidate) -> bool:
+        async with self._connect() as db:
+            cursor = await db.execute(
+                """
+                UPDATE radar_events
+                SET source_key = 'manual', filter_reason = NULL, updated_at = ?,
+                    status = CASE WHEN status = ? THEN ? ELSE ? END
+                WHERE source = ? AND external_id = ? AND status IN (?, ?)
+                """,
+                (
+                    datetime.now(UTC).isoformat(),
+                    EventStatus.ARCHIVED.value,
+                    EventStatus.SHORTLISTED.value,
+                    EventStatus.DISCOVERED.value,
+                    event.source.value,
+                    event.external_id,
+                    EventStatus.ARCHIVED.value,
+                    EventStatus.FILTERED_OUT.value,
+                ),
+            )
+            await db.commit()
+            return cursor.rowcount == 1
 
     async def get_state(self, key: str) -> str | None:
         async with self._connect() as db:
@@ -769,9 +792,7 @@ class SQLiteEventRepository:
 
     async def source_health(self) -> list[SourceHealth]:
         async with self._connect() as db:
-            rows = await db.execute_fetchall(
-                "SELECT * FROM source_checkpoints ORDER BY source_key"
-            )
+            rows = await db.execute_fetchall("SELECT * FROM source_checkpoints ORDER BY source_key")
         return [
             SourceHealth.model_validate({k: v for k, v in dict(row).items() if k != "cursor_value"})
             for row in rows

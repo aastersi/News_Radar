@@ -272,7 +272,7 @@ async def test_llm_writer_repairs_a_paraphrased_quote_once(
 
     assert result.outcome is DraftOutcome.CREATED and result.draft is not None
     assert result.draft.quote_text == QUOTE
-    assert result.draft.model_name == "draft-model" and result.draft.prompt_version == "draft-v1"
+    assert result.draft.model_name == "draft-model" and result.draft.prompt_version == "draft-v2"
     assert len(model.payloads) == 2
     assert "quote_text is not an exact fragment" in model.payloads[1]["messages"][3]["content"]
 

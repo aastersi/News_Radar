@@ -63,6 +63,7 @@ async def run_production(settings: RadarSettings) -> int:
                     ),
                 ],
                 stop,
+                on_stop=runtime.dispatcher.stop_polling,
             )
     except Exception as exc:
         logger.exception(
@@ -74,11 +75,32 @@ async def run_production(settings: RadarSettings) -> int:
     return 0
 
 
-async def serve(jobs: Sequence[Callable[[], Awaitable[None]]], stop: asyncio.Event) -> None:
-    """Run jobs until `stop` is set or one of them fails, then cancel and await all of them."""
+async def serve(
+    jobs: Sequence[Callable[[], Awaitable[None]]],
+    stop: asyncio.Event,
+    *,
+    on_stop: Callable[[], Awaitable[None]] | None = None,
+) -> None:
+    """Run jobs until `stop` is set or one of them fails, then cancel and await all of them.
+
+    On a requested stop `on_stop` runs first, so polling ends and started handlers finish
+    before anything is cancelled.
+    """
     tasks = [asyncio.ensure_future(job()) for job in jobs]
     stopper = asyncio.ensure_future(stop.wait())
     done, _ = await asyncio.wait([*tasks, stopper], return_when=asyncio.FIRST_COMPLETED)
+    if stopper in done and on_stop is not None:
+        try:
+            await on_stop()
+        except Exception as exc:
+            logger.warning(
+                "graceful stop step failed",
+                extra={
+                    "operation": "shutdown",
+                    "result": "skipped",
+                    "error_code": type(exc).__name__,
+                },
+            )
     for task in [*tasks, stopper]:
         task.cancel()
     await asyncio.gather(*tasks, stopper, return_exceptions=True)
