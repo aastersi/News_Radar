@@ -26,6 +26,8 @@ from qmemo_radar.infrastructure.ranking import DeterministicFixtureRanker
 from qmemo_radar.infrastructure.storage import SQLiteEventRepository
 
 HEARTBEAT_MAX_AGE = timedelta(minutes=3)
+SAMPLE_MAX = 100
+SAMPLE_TEXT_CHARS = 500
 DRY_RUN_USER_ID = 0
 
 
@@ -33,14 +35,38 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="qmemo-radar")
     parser.add_argument(
         "command",
-        choices=("init-db", "status", "dry-run", "run", "healthcheck", "check-config"),
+        choices=("init-db", "status", "dry-run", "run", "healthcheck", "check-config", "sample"),
     )
     parser.add_argument("--db", type=Path, help="Override SQLite path")
+    parser.add_argument(
+        "--source", default="gdelt", help="sample: source (gdelt, rss, x) or key (rss:wire)"
+    )
+    parser.add_argument(
+        "--limit", type=_sample_limit, default=20, help=f"sample: 1-{SAMPLE_MAX} items"
+    )
+    parser.add_argument("--random", action="store_true", help="sample: random instead of newest")
     return parser
 
 
-async def execute(command: str, *, db_path: Path | None = None) -> int:
+def _sample_limit(value: str) -> int:
+    number = int(value)
+    if not 1 <= number <= SAMPLE_MAX:
+        raise argparse.ArgumentTypeError(f"must be between 1 and {SAMPLE_MAX}")
+    return number
+
+
+async def execute(
+    command: str,
+    *,
+    db_path: Path | None = None,
+    source: str = "gdelt",
+    limit: int = 20,
+    random: bool = False,
+) -> int:
     settings = RadarSettings(db_path=db_path) if db_path else RadarSettings()
+
+    if command == "sample":
+        return await _sample(settings, source=source, limit=min(limit, SAMPLE_MAX), random=random)
 
     if command == "run":
         from qmemo_radar.interfaces.runtime import run_production
@@ -165,6 +191,33 @@ def _check_config(settings: RadarSettings) -> int:
     return 0 if not problems else 78
 
 
+async def _sample(settings: RadarSettings, *, source: str, limit: int, random: bool) -> int:
+    """Read-only look at what a source really stored: no network, no LLM, no writes."""
+    if not settings.db_path.is_file():
+        print(json.dumps({"status": "error", "error": f"database not found: {settings.db_path}"}))
+        return 1
+    rows = await SQLiteEventRepository(settings.db_path).sample_events(
+        source.strip().lower(), limit=limit, random=random
+    )
+    items = [
+        {
+            "source": row["source_key"] or row["source"],
+            "published_at": row["published_at"],
+            "discovered_at": row["discovered_at"],
+            "status": row["status"],
+            "filter_reason": row["filter_reason"],
+            "author": row["author_display_name"] or row["author_handle"],
+            "language": row["language"],
+            "title": row["title"],
+            "text": str(row["original_text"])[:SAMPLE_TEXT_CHARS],
+            "url": row["url"],
+        }
+        for row in rows
+    ]
+    print(json.dumps({"status": "ok", "count": len(items), "items": items}, ensure_ascii=False))
+    return 0
+
+
 async def _healthcheck(settings: RadarSettings) -> int:
     """Healthy when the scheduler heartbeat in SQLite is recent. Never creates the database."""
     heartbeat = None
@@ -231,4 +284,14 @@ def _sample_items() -> list[RawSourceItem]:
 
 def main() -> None:
     args = build_parser().parse_args()
-    raise SystemExit(asyncio.run(execute(args.command, db_path=args.db)))
+    raise SystemExit(
+        asyncio.run(
+            execute(
+                args.command,
+                db_path=args.db,
+                source=args.source,
+                limit=args.limit,
+                random=args.random,
+            )
+        )
+    )

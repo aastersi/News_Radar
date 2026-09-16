@@ -543,6 +543,28 @@ class SQLiteEventRepository:
             await db.commit()
             return cursor.rowcount == 1
 
+    async def sample_events(
+        self, source: str, *, limit: int, random: bool
+    ) -> list[dict[str, object]]:
+        """Newest (or random) stored items of a source (`gdelt`) or source key (`rss:wire`).
+
+        Opens the file read-only: this can neither migrate nor change the database.
+        """
+        column = "source_key" if ":" in source else "source"
+        order = "RANDOM()" if random else "rowid DESC"
+        async with aiosqlite.connect(f"{self._db_path.resolve().as_uri()}?mode=ro", uri=True) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await db.execute_fetchall(
+                f"""
+                SELECT source, source_key, status, filter_reason, published_at, discovered_at,
+                       author_handle, author_display_name, language, original_text, url,
+                       json_extract(raw_payload_json, '$.title') AS title
+                FROM radar_events WHERE {column} = ? ORDER BY {order} LIMIT ?
+                """,
+                (source, limit),
+            )
+        return [dict(row) for row in rows]
+
     async def get_state(self, key: str) -> str | None:
         async with self._connect() as db:
             rows = list(
