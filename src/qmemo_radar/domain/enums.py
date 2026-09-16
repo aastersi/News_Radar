@@ -1,0 +1,37 @@
+from enum import StrEnum
+
+
+class SourceType(StrEnum):
+    X = "x"
+    RSS = "rss"
+    MANUAL = "manual"
+
+
+class EventStatus(StrEnum):
+    DISCOVERED = "DISCOVERED"
+    FILTERED_OUT = "FILTERED_OUT"
+    SCORED = "SCORED"
+    SHORTLISTED = "SHORTLISTED"
+    NOTIFIED = "NOTIFIED"
+    SNOOZED = "SNOOZED"
+    SKIPPED = "SKIPPED"
+    ARCHIVED = "ARCHIVED"
+    DRAFTED = "DRAFTED"
+    APPROVED = "APPROVED"
+    EXPIRED = "EXPIRED"
+
+
+class OutboxStatus(StrEnum):
+    APPROVED = "APPROVED"
+    QMEMO_PENDING = "QMEMO_PENDING"
+    QMEMO_PUBLISHED = "QMEMO_PUBLISHED"
+    X_PENDING = "X_PENDING"
+    PUBLISHED = "PUBLISHED"
+    FAILED = "FAILED"
+    VERIFY_REQUIRED = "VERIFY_REQUIRED"
+
+
+class FactCheckStatus(StrEnum):
+    VERIFIED = "VERIFIED"
+    NEEDS_REVIEW = "NEEDS_REVIEW"
+
