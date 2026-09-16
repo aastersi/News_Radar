@@ -66,6 +66,12 @@ class EventRepository(Protocol):
 
     async def metrics_since(self, since: datetime) -> dict[str, dict[str, int]]: ...
 
+    async def count_prunable_noise(self, discovered_before: datetime) -> dict[str, int]:
+        """Events that retention may delete: FILTERED_OUT, EXPIRED or ARCHIVED, discovered before
+        the cutoff, never delivered, never drafted, without feedback or outbox package, and not
+        the original of a stored duplicate. Counted per status; nothing is deleted."""
+        ...
+
     async def list_events_by_status(
         self,
         status: EventStatus,

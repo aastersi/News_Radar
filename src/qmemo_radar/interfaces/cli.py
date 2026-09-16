@@ -73,6 +73,13 @@ async def execute(command: str, *, db_path: Path | None = None) -> int:
                     "outbox_approved": await app.repository.count_packages(OutboxStatus.APPROVED),
                     "ingestion_24h": await app.repository.metrics_since(now - timedelta(days=1)),
                     "cost_month_usd": str(await app.repository.cost_since(month_start(now))),
+                    "retention": {
+                        "raw_retention_days": settings.raw_retention_days,
+                        "prunable_events": await app.repository.count_prunable_noise(
+                            now - timedelta(days=settings.raw_retention_days)
+                        ),
+                        "automatic_deletion": False,
+                    },
                     "cost_hard_limit_usd_monthly": str(settings.cost_hard_limit_usd_monthly),
                     "qmemo_publishing": settings.qmemo_publishing_enabled,
                     "x_publishing": settings.x_publishing_enabled,

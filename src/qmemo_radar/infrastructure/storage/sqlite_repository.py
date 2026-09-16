@@ -47,6 +47,8 @@ _INSERT_EVENT = """
         source_key, filter_reason, duplicate_of_event_id
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
+# Retention candidates; everything a person touched is kept regardless of status.
+_NOISE = (EventStatus.FILTERED_OUT, EventStatus.EXPIRED, EventStatus.ARCHIVED)
 _EXPIRABLE = (
     EventStatus.DISCOVERED,
     EventStatus.SCORED,
@@ -127,6 +129,26 @@ class SQLiteEventRepository:
                 )
                 owners = {str(row[0]): str(row[1]) for row in rows}
         return KnownEvents(ids=frozenset(ids), urls=frozenset(urls), content_owners=owners)
+
+    async def count_prunable_noise(self, discovered_before: datetime) -> dict[str, int]:
+        values = [status.value for status in _NOISE]
+        async with self._connect() as db:
+            rows = await db.execute_fetchall(
+                f"""
+                SELECT e.status, COUNT(*) FROM radar_events e
+                WHERE e.status IN ({_placeholders(values)}) AND e.discovered_at < ?
+                  AND NOT EXISTS (SELECT 1 FROM telegram_deliveries d WHERE d.event_id = e.id)
+                  AND NOT EXISTS (SELECT 1 FROM drafts r WHERE r.event_id = e.id)
+                  AND NOT EXISTS (SELECT 1 FROM feedback f WHERE f.event_id = e.id)
+                  AND NOT EXISTS (SELECT 1 FROM publication_outbox o WHERE o.event_id = e.id)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM radar_events c WHERE c.duplicate_of_event_id = e.id
+                  )
+                GROUP BY e.status
+                """,
+                (*values, discovered_before.astimezone(UTC).isoformat()),
+            )
+        return {str(status): int(count) for status, count in rows}
 
     async def record_metrics(
         self, run_id: str, metrics: Mapping[str, Mapping[Metric, int]]
