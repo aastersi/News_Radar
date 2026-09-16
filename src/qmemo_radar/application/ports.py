@@ -1,8 +1,10 @@
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
+from decimal import Decimal
 from typing import Protocol
 
 from qmemo_radar.domain import (
+    CostEntry,
     DeliveryKind,
     Draft,
     DraftText,
@@ -209,7 +211,22 @@ class OutboxRepository(DraftRepository, Protocol):
     async def count_packages(self, status: OutboxStatus) -> int: ...
 
 
-class RunRepository(OutboxRepository, Protocol):
+class CostLedger(Protocol):
+    async def reserve_cost(
+        self, entry: CostEntry, *, since: datetime, limit_usd: Decimal
+    ) -> tuple[int, Decimal] | None:
+        """Atomically store the entry only if spend since `since` plus the entry stays within
+        `limit_usd`. Returns (entry id, new total) or None when the limit would be exceeded."""
+        ...
+
+    async def settle_cost(self, entry_id: int, *, units: int, cost_usd: Decimal) -> None:
+        """Lower a reservation to the actual cost. A reservation is never raised."""
+        ...
+
+    async def cost_since(self, since: datetime) -> Decimal: ...
+
+
+class RunRepository(OutboxRepository, CostLedger, Protocol):
     async def start_run(self, run_id: str) -> None: ...
 
     async def finish_run(

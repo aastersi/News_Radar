@@ -4,7 +4,7 @@ from typing import Any
 
 import httpx
 import pytest
-from fakes import snowflake
+from fakes import open_guard, snowflake
 
 from qmemo_radar.application.filtering import FilterPolicy
 from qmemo_radar.application.normalization import parse_x_status_url
@@ -68,7 +68,7 @@ class Recorder:
         http = httpx.AsyncClient(
             base_url="https://api.x.com", transport=httpx.MockTransport(self.handler)
         )
-        return XApiClient(http, sleep=self.sleep)
+        return XApiClient(http, guard=open_guard(), sleep=self.sleep)
 
 
 def collector(recorder: Recorder, *queries: str, pages: int = 1) -> XRecentSearchCollector:

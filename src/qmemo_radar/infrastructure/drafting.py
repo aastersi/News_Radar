@@ -5,7 +5,7 @@ from pydantic import ValidationError
 
 from qmemo_radar.application.drafting import build_draft
 from qmemo_radar.domain import QMEMO_URL_PLACEHOLDER, Draft, DraftText, ScoredEvent
-from qmemo_radar.exceptions import DraftFailed
+from qmemo_radar.exceptions import BudgetBlocked, DraftFailed
 from qmemo_radar.infrastructure.http import HttpFailure
 from qmemo_radar.infrastructure.llm import (
     ChatCompletionsClient,
@@ -73,6 +73,8 @@ class LlmDraftWriter:
                 max_tokens=2000,
                 operation="draft",
             )
+        except BudgetBlocked as exc:
+            raise DraftFailed(exc.code) from exc
         except HttpFailure as exc:
             raise DraftFailed(f"llm_{exc.code}") from exc
         except ValueError as exc:

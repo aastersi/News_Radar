@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 
+from qmemo_radar.application.budget import BudgetGuard, PaidFeature
 from qmemo_radar.application.drafting import DraftService
 from qmemo_radar.application.filtering import FilterPolicy
 from qmemo_radar.application.normalization import comparison_text
@@ -179,8 +180,9 @@ async def build_runtime(settings: RadarSettings, sources: SourcesConfig) -> Asyn
     async with build_x_http_client(settings) as x_http, build_llm_http_client(settings) as llm_http:
         bot = build_bot(settings.telegram_bot_token.get_secret_value())
         try:
-            x_client = XApiClient(x_http)
-            llm = build_llm_client(settings, llm_http)
+            guard = build_budget_guard(settings, application.repository)
+            x_client = XApiClient(x_http, guard=guard)
+            llm = build_llm_client(settings, llm_http, guard)
             services = build_services(
                 application,
                 collector=build_x_collector(x_client, settings, sources),
@@ -247,11 +249,32 @@ def build_x_collector(
     )
 
 
-def build_llm_client(settings: RadarSettings, http: httpx.AsyncClient) -> ChatCompletionsClient:
+def build_budget_guard(settings: RadarSettings, ledger: SQLiteEventRepository) -> BudgetGuard:
+    """The single BudgetGuard of a process. Every paid adapter must receive this instance."""
+    enabled = {
+        PaidFeature.X_SEARCH: settings.x_search_enabled,
+        PaidFeature.X_LOOKUP: settings.paid_sources_enabled,
+        PaidFeature.LLM: settings.paid_llm_enabled,
+    }
+    return BudgetGuard(
+        ledger,
+        enabled=frozenset(feature for feature, on in enabled.items() if on),
+        hard_limit_usd=settings.cost_hard_limit_usd_monthly,
+        target_usd=settings.cost_target_usd_monthly,
+    )
+
+
+def build_llm_client(
+    settings: RadarSettings, http: httpx.AsyncClient, guard: BudgetGuard
+) -> ChatCompletionsClient:
     if not settings.llm_model:
         raise ValueError("RADAR_LLM_MODEL is required")
     return ChatCompletionsClient(
-        http, model=settings.llm_model, temperature=settings.llm_temperature
+        http,
+        model=settings.llm_model,
+        guard=guard,
+        cost_per_call_usd=settings.llm_cost_per_call_usd,
+        temperature=settings.llm_temperature,
     )
 
 

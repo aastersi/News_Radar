@@ -3,12 +3,14 @@ import sqlite3
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from decimal import ROUND_CEILING, Decimal
 from importlib.resources import files
 from pathlib import Path
 
 import aiosqlite
 
 from qmemo_radar.domain import (
+    CostEntry,
     DeliveryKind,
     Draft,
     DraftStatus,
@@ -790,6 +792,57 @@ class SQLiteEventRepository:
                 setattr(total, name, getattr(total, name) + getattr(counters, name))
         return total
 
+    async def reserve_cost(
+        self, entry: CostEntry, *, since: datetime, limit_usd: Decimal
+    ) -> tuple[int, Decimal] | None:
+        cost = _micros(entry.estimated_cost_usd)
+        # BEGIN IMMEDIATE takes the write lock before reading the total, so concurrent
+        # reservations (other tasks or processes) are serialized and cannot overspend.
+        async with self._transaction() as db:
+            [(spent,)] = await db.execute_fetchall(
+                "SELECT COALESCE(SUM(estimated_cost_micros), 0) FROM cost_ledger "
+                "WHERE created_at >= ?",
+                (since.astimezone(UTC).isoformat(),),
+            )
+            if spent + cost > _micros(limit_usd):
+                return None
+            cursor = await db.execute(
+                """
+                INSERT INTO cost_ledger (
+                    provider, operation, units, estimated_cost_micros, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    entry.provider,
+                    entry.operation,
+                    entry.units,
+                    cost,
+                    entry.created_at.astimezone(UTC).isoformat(),
+                ),
+            )
+            assert cursor.lastrowid is not None
+            return cursor.lastrowid, Decimal(spent + cost) / _MICROS
+
+    async def settle_cost(self, entry_id: int, *, units: int, cost_usd: Decimal) -> None:
+        async with self._connect() as db:
+            await db.execute(
+                """
+                UPDATE cost_ledger SET units = ?, estimated_cost_micros = ?
+                WHERE id = ? AND estimated_cost_micros >= ?
+                """,
+                (units, _micros(cost_usd), entry_id, _micros(cost_usd)),
+            )
+            await db.commit()
+
+    async def cost_since(self, since: datetime) -> Decimal:
+        async with self._connect() as db:
+            [(spent,)] = await db.execute_fetchall(
+                "SELECT COALESCE(SUM(estimated_cost_micros), 0) FROM cost_ledger "
+                "WHERE created_at >= ?",
+                (since.astimezone(UTC).isoformat(),),
+            )
+        return Decimal(spent) / _MICROS
+
     async def source_health(self) -> list[SourceHealth]:
         async with self._connect() as db:
             rows = await db.execute_fetchall("SELECT * FROM source_checkpoints ORDER BY source_key")
@@ -869,6 +922,14 @@ class SQLiteEventRepository:
             yield db
         finally:
             await db.close()
+
+
+_MICROS = 1_000_000
+
+
+def _micros(usd: Decimal) -> int:
+    """Round up: an estimate may only err on the expensive side."""
+    return int((usd * _MICROS).to_integral_value(rounding=ROUND_CEILING))
 
 
 def _placeholders(values: list[str]) -> str:

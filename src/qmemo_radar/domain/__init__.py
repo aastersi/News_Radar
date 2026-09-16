@@ -10,6 +10,7 @@ from qmemo_radar.domain.enums import (
 )
 from qmemo_radar.domain.models import (
     QMEMO_URL_PLACEHOLDER,
+    CostEntry,
     Draft,
     DraftText,
     Engagement,
@@ -27,6 +28,7 @@ from qmemo_radar.domain.models import (
 
 __all__ = [
     "QMEMO_URL_PLACEHOLDER",
+    "CostEntry",
     "DeliveryKind",
     "Draft",
     "DraftStatus",

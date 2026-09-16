@@ -7,14 +7,16 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 import httpx
 from pydantic import HttpUrl, ValidationError
 
+from qmemo_radar.application.budget import BudgetGuard, PaidFeature
 from qmemo_radar.application.filtering import MANUAL_SOURCE_KEY
 from qmemo_radar.domain import Engagement, RawSourceItem, SourceFetch, SourceType
-from qmemo_radar.exceptions import SourceUnavailable
+from qmemo_radar.exceptions import BudgetBlocked, SourceUnavailable
 from qmemo_radar.infrastructure.http import HttpFailure, Sleep, send_with_retry
 
 logger = logging.getLogger(__name__)
@@ -33,6 +35,11 @@ _X_EPOCH_MS = 1288834974657  # post ids are snowflakes: (id >> 22) + epoch = cre
 # Recent search only covers 7 days; an older since_id (a quiet account) would be rejected.
 SINCE_ID_MAX_AGE = timedelta(days=6)
 _HANDLE = re.compile(r"[A-Za-z0-9_]{1,15}")
+# Pay-per-use prices from https://docs.x.com/x-api/getting-started/pricing (checked 2026-09-17).
+# Whether expanded authors are billed is not documented, so they are counted as user reads.
+X_POST_READ_USD = Decimal("0.005")
+X_USER_READ_USD = Decimal("0.010")
+_PAGE_SIZE = 100
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,8 +49,11 @@ class XQuery:
 
 
 class XApiClient:
-    def __init__(self, http: httpx.AsyncClient, *, sleep: Sleep = asyncio.sleep) -> None:
+    def __init__(
+        self, http: httpx.AsyncClient, *, guard: BudgetGuard, sleep: Sleep = asyncio.sleep
+    ) -> None:
         self._http = http
+        self._guard = guard
         self._sleep = sleep
 
     async def search_recent(
@@ -57,7 +67,7 @@ class XApiClient:
     ) -> tuple[list[RawSourceItem], str | None]:
         params: dict[str, str | int] = {
             "query": query,
-            "max_results": 100,
+            "max_results": _PAGE_SIZE,
             "sort_order": "recency",
             **_FIELDS,
         }
@@ -70,7 +80,9 @@ class XApiClient:
         items: list[RawSourceItem] = []
         newest_id: str | None = None
         for _ in range(max_pages):
-            body = await self._get("/2/tweets/search/recent", params, source_key)
+            body = await self._paid_get(
+                PaidFeature.X_SEARCH, "/2/tweets/search/recent", params, source_key, _PAGE_SIZE
+            )
             meta = _mapping(body.get("meta"))
             # Results are newest first, so the first page carries the overall newest id.
             newest_id = newest_id or meta.get("newest_id")
@@ -91,7 +103,9 @@ class XApiClient:
     async def lookup_post(self, post_id: str) -> RawSourceItem:
         if not _POST_ID.fullmatch(post_id):
             raise SourceUnavailable("invalid_post_id")
-        body = await self._get(f"/2/tweets/{post_id}", dict(_FIELDS), MANUAL_SOURCE_KEY)
+        body = await self._paid_get(
+            PaidFeature.X_LOOKUP, f"/2/tweets/{post_id}", dict(_FIELDS), MANUAL_SOURCE_KEY, 1
+        )
         data = body.get("data")
         if not isinstance(data, dict):
             raise SourceUnavailable("not_found")
@@ -99,6 +113,39 @@ class XApiClient:
         if not items:
             raise SourceUnavailable("invalid_response")
         return items[0]
+
+    async def _paid_get(
+        self,
+        feature: PaidFeature,
+        path: str,
+        params: Mapping[str, str | int],
+        source_key: str,
+        max_posts: int,
+    ) -> dict[str, Any]:
+        """Reserve the worst case before the request, then lower it to what was returned."""
+        try:
+            entry_id = await self._guard.reserve(
+                feature,
+                provider="x",
+                operation=feature.value,
+                units=max_posts * 2,
+                cost_usd=max_posts * (X_POST_READ_USD + X_USER_READ_USD),
+            )
+        except BudgetBlocked as exc:
+            raise SourceUnavailable(exc.code) from exc
+        body: dict[str, Any] = {}
+        try:
+            body = await self._get(path, params, source_key)
+        finally:
+            data = body.get("data")
+            posts = len(data) if isinstance(data, list) else int(isinstance(data, dict))
+            users = min(len(_sequence(_mapping(body.get("includes")).get("users"))), max_posts)
+            await self._guard.settle(
+                entry_id,
+                units=posts + users,
+                cost_usd=posts * X_POST_READ_USD + users * X_USER_READ_USD,
+            )
+        return body
 
     async def _get(
         self,

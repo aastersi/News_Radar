@@ -5,7 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from qmemo_radar.application.scoring import calculate_total
 from qmemo_radar.domain import EventCandidate, ScoreBreakdown, ScoreResult
-from qmemo_radar.exceptions import RankingFailed
+from qmemo_radar.exceptions import BudgetBlocked, RankingFailed
 from qmemo_radar.infrastructure.http import HttpFailure
 from qmemo_radar.infrastructure.llm import (
     ChatCompletionsClient,
@@ -143,6 +143,8 @@ class LlmRanker:
                 max_tokens=4000,
                 operation="rank",
             )
+        except BudgetBlocked as exc:
+            raise RankingFailed(exc.code, retryable=True) from exc
         except HttpFailure as exc:
             raise RankingFailed(f"llm_{exc.code}", retryable=True) from exc
         except ValueError as exc:

@@ -1,4 +1,5 @@
 from datetime import time
+from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -47,10 +48,26 @@ class RadarSettings(BaseSettings):
     qmemo_publishing_enabled: bool = False
     x_publishing_enabled: bool = False
 
+    # External API money. The hard limit can be lowered but never raised above $10/month.
+    cost_target_usd_monthly: Decimal = Field(default=Decimal(0), ge=0, le=10)
+    cost_hard_limit_usd_monthly: Decimal = Field(default=Decimal(10), ge=0, le=10)
+    paid_sources_enabled: bool = False
+    paid_llm_enabled: bool = False
+    x_paid_search_enabled: bool = False
+    # The price of one LLM request is unknown to the code; without this estimate every paid
+    # LLM call is blocked. Use 0 only for a provider that is really free (e.g. a local model).
+    llm_cost_per_call_usd: Decimal | None = Field(default=None, ge=0, le=1)
+
+    # Noise (FILTERED_OUT, EXPIRED, ARCHIVED without any human action) older than this is
+    # reported as prunable. Nothing is deleted automatically yet.
+    raw_retention_days: int = Field(default=14, ge=7, le=365)
+
     @model_validator(mode="after")
     def validate_thresholds_and_timezone(self) -> "RadarSettings":
         if not (self.archive_threshold <= self.digest_threshold <= self.urgent_threshold):
             raise ValueError("Thresholds must satisfy archive <= digest <= urgent")
+        if self.cost_target_usd_monthly > self.cost_hard_limit_usd_monthly:
+            raise ValueError("RADAR_COST_TARGET_USD_MONTHLY must not exceed the hard limit")
         try:
             ZoneInfo(self.timezone)
         except ZoneInfoNotFoundError as exc:
@@ -74,17 +91,32 @@ class RadarSettings(BaseSettings):
             raise ValueError("RADAR_DIGEST_TIMES must contain two or three different times")
         return times
 
+    @property
+    def x_search_enabled(self) -> bool:
+        return self.paid_sources_enabled and self.x_paid_search_enabled
+
     def production_problems(self) -> list[str]:
-        """What prevents `qmemo-radar run`. Empty means the configuration is complete."""
-        required = {
+        """What prevents `qmemo-radar run`. Empty means the configuration is complete.
+
+        Credentials are required only for what is enabled: a disabled paid feature needs nothing.
+        """
+        required: dict[str, object] = {
             "RADAR_TELEGRAM_BOT_TOKEN": self.telegram_bot_token,
             "RADAR_ALLOWED_TELEGRAM_ID": self.allowed_telegram_id,
-            "RADAR_X_BEARER_TOKEN": self.x_bearer_token,
-            "RADAR_LLM_BASE_URL": self.llm_base_url,
-            "RADAR_LLM_API_KEY": self.llm_api_key,
-            "RADAR_LLM_MODEL": self.llm_model,
         }
-        problems = [f"{name} is required" for name, value in required.items() if not value]
+        if self.x_search_enabled:
+            required["RADAR_X_BEARER_TOKEN"] = self.x_bearer_token
+        if self.paid_llm_enabled:
+            required |= {
+                "RADAR_LLM_BASE_URL": self.llm_base_url,
+                "RADAR_LLM_API_KEY": self.llm_api_key,
+                "RADAR_LLM_MODEL": self.llm_model,
+                "RADAR_LLM_COST_PER_CALL_USD": self.llm_cost_per_call_usd,
+            }
+        # `in (None, "")`, not `not value`: a cost estimate of 0 is a valid setting.
+        problems = [f"{name} is required" for name, val in required.items() if val in (None, "")]
+        if self.x_paid_search_enabled and not self.paid_sources_enabled:
+            problems.append("RADAR_X_PAID_SEARCH_ENABLED=true requires RADAR_PAID_SOURCES_ENABLED")
         # No real publisher exists yet, so enabling publishing must stop the service.
         if self.qmemo_publishing_enabled:
             problems.append("RADAR_QMEMO_PUBLISHING_ENABLED must stay false in this version")

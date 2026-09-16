@@ -10,6 +10,7 @@ from typing import Any
 
 import httpx
 import pytest
+from fakes import LLM_CALL_USD, open_guard
 from pydantic import HttpUrl
 
 from qmemo_radar.application.filtering import FilterPolicy
@@ -114,7 +115,11 @@ class FakeModel:
             headers={"Authorization": f"Bearer {API_KEY}"},
             transport=httpx.MockTransport(self.handler),
         )
-        return LlmRanker(ChatCompletionsClient(http, model="test-model"))
+        return LlmRanker(
+            ChatCompletionsClient(
+                http, model="test-model", guard=open_guard(), cost_per_call_usd=LLM_CALL_USD
+            )
+        )
 
 
 def radar(
@@ -251,7 +256,13 @@ async def test_one_poisoned_post_does_not_block_its_batch(
     items.append(fixture_item({**FIXTURES[11], "key": "poison", "text": poison}))
 
     counters = await radar(
-        LlmRanker(ChatCompletionsClient(http, model="m")), repository, items
+        LlmRanker(
+            ChatCompletionsClient(
+                http, model="m", guard=open_guard(), cost_per_call_usd=LLM_CALL_USD
+            )
+        ),
+        repository,
+        items,
     ).run_once()
 
     assert counters.scored == 5 and counters.rank_failed == 1
@@ -273,7 +284,9 @@ async def test_unreachable_provider_keeps_events_for_the_next_run(
         return None
 
     http = httpx.AsyncClient(base_url="https://llm.test/v1", transport=httpx.MockTransport(handler))
-    ranker = LlmRanker(ChatCompletionsClient(http, model="m", sleep=no_sleep))
+    ranker = LlmRanker(ChatCompletionsClient(
+        http, model="m", guard=open_guard(), cost_per_call_usd=LLM_CALL_USD, sleep=no_sleep
+    ))
     items = [fixture_item(entry) for entry in FIXTURES[:12]]
 
     counters = await radar(ranker, repository, items).run_once()
@@ -362,7 +375,7 @@ async def test_live_model_respects_fixture_priorities() -> None:
     entries = [entry for entry in FIXTURES if entry["category"] in ranked_categories]
     candidates = [build_candidate(fixture_item(entry)) for entry in entries]
     async with build_llm_http_client(settings) as http:
-        ranker = LlmRanker(build_llm_client(settings, http))
+        ranker = LlmRanker(build_llm_client(settings, http, open_guard()))
         results = [
             result
             for start in range(0, len(candidates), 10)
