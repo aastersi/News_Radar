@@ -58,11 +58,12 @@ class RadarPipeline:
 
     async def run_once(self, *, run_id: str | None = None) -> PipelineCounters:
         run_id = run_id or uuid4().hex
-        metrics: defaultdict[str, Counter[Metric]] = defaultdict(Counter)
+        metrics: defaultdict[str, Counter[str]] = defaultdict(Counter)
         checkpoints = await self._repository.get_checkpoints()
         for fetch in await self._collector.collect(checkpoints):
             log = {"run_id": run_id, "operation": "collect", "source_key": fetch.source_key}
             stats = metrics[fetch.source_key]
+            stats.update(fetch.stats)
             if fetch.error_code:
                 stats[Metric.SOURCE_ERRORS] += 1
                 await self._repository.record_source_result(
@@ -197,7 +198,7 @@ class RadarPipeline:
                 counters.archived += 1
         return True
 
-    async def _ingest(self, items: Sequence[RawSourceItem], stats: Counter[Metric]) -> None:
+    async def _ingest(self, items: Sequence[RawSourceItem], stats: Counter[str]) -> None:
         """Stage 1 for one chunk: normalize, screen, drop exact duplicates, insert in one commit.
 
         Future stages (near dedup, clustering, preselection) read DISCOVERED events after this
@@ -255,8 +256,8 @@ def _metric_for(reason: str) -> Metric:
     return Metric.EXACT_DUPLICATES if reason == DUPLICATE_CONTENT else Metric.FILTERED
 
 
-def _describe(stats: Counter[Metric]) -> str:
-    return " ".join(f"{metric.value}={value}" for metric, value in stats.items() if value)
+def _describe(stats: Counter[str]) -> str:
+    return " ".join(f"{metric}={value}" for metric, value in stats.items() if value)
 
 
 def _validate_results(

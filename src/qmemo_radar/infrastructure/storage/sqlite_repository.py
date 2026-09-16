@@ -21,7 +21,6 @@ from qmemo_radar.domain import (
     EventStatus,
     FactCheckStatus,
     FeedbackAction,
-    Metric,
     OutboxStatus,
     PipelineCounters,
     PipelineRun,
@@ -159,11 +158,11 @@ class SQLiteEventRepository:
         return {str(status): int(count) for status, count in rows}
 
     async def record_metrics(
-        self, run_id: str, metrics: Mapping[str, Mapping[Metric, int]]
+        self, run_id: str, metrics: Mapping[str, Mapping[str, int]]
     ) -> None:
         now = datetime.now(UTC).isoformat()
         rows = [
-            (run_id, source_key, metric.value, value, now)
+            (run_id, source_key, str(metric), value, now)
             for source_key, values in metrics.items()
             for metric, value in values.items()
             if value
