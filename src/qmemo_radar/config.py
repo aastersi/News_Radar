@@ -4,7 +4,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -62,10 +62,28 @@ class RadarSettings(BaseSettings):
     # reported as prunable. Nothing is deleted automatically yet.
     raw_retention_days: int = Field(default=14, ge=7, le=365)
 
+    # Free sources: no key, no BudgetGuard. GDELT is off by default because it adds tens of
+    # thousands of quotes per hour; RSS is on as soon as sources.yaml lists an enabled feed.
+    gdelt_enabled: bool = False
+    # Minutes newer than now minus this are never requested: a 404 there may be a late file.
+    gdelt_safety_lag_minutes: int = Field(default=10, ge=2, le=1440)
+    # Minute files checked per collection; bounds one catch-up run after a long downtime and the
+    # items held in memory (measured: up to ~33k English quotes, ~100 MB, per hour of files).
+    gdelt_max_minutes_per_run: int = Field(default=60, ge=1, le=120)
+    # Comma-separated GDELT language names (e.g. English,Spanish), case-insensitive; * = all.
+    gdelt_languages: str = "English"
+    gdelt_allow_unknown_language: bool = False
+    rss_max_response_bytes: int = Field(default=5_000_000, ge=10_000, le=5_000_000)
+
     @model_validator(mode="after")
     def validate_thresholds_and_timezone(self) -> "RadarSettings":
         if not (self.archive_threshold <= self.digest_threshold <= self.urgent_threshold):
             raise ValueError("Thresholds must satisfy archive <= digest <= urgent")
+        if self.gdelt_enabled and self.gdelt_max_minutes_per_run < self.collect_interval_minutes:
+            raise ValueError(
+                "RADAR_GDELT_MAX_MINUTES_PER_RUN must be at least RADAR_COLLECT_INTERVAL_MINUTES,"
+                " otherwise GDELT falls further behind on every run"
+            )
         if self.cost_target_usd_monthly > self.cost_hard_limit_usd_monthly:
             raise ValueError("RADAR_COST_TARGET_USD_MONTHLY must not exceed the hard limit")
         try:
@@ -90,6 +108,13 @@ class RadarSettings(BaseSettings):
         if not 2 <= len(times) <= 3:
             raise ValueError("RADAR_DIGEST_TIMES must contain two or three different times")
         return times
+
+    @property
+    def gdelt_language_set(self) -> frozenset[str] | None:
+        """Casefolded allowed languages; None means every language."""
+        names = {name.strip().casefold() for name in self.gdelt_languages.split(",")}
+        names.discard("")
+        return None if "*" in names else frozenset(names)
 
     @property
     def x_search_enabled(self) -> bool:
@@ -157,10 +182,21 @@ class XSources(_SourcesModel):
     max_pages_per_query: int = Field(default=1, ge=1, le=10)
 
 
+class RssFeed(_SourcesModel):
+    name: str = Field(pattern=r"^[a-z0-9_]{1,40}$")
+    url: HttpUrl
+    enabled: bool = True
+
+
+class RssSources(_SourcesModel):
+    feeds: tuple[RssFeed, ...] = ()
+
+
 class SourcesConfig(_SourcesModel):
-    """Contents of sources.yaml: what to read from X and what to always drop."""
+    """Contents of sources.yaml: what to read and what to always drop."""
 
     x: XSources = XSources()
+    rss: RssSources = RssSources()
     blocked_authors: tuple[str, ...] = ()
     blocked_terms: tuple[str, ...] = ()
 
@@ -170,6 +206,9 @@ class SourcesConfig(_SourcesModel):
         names = [query.name for query in self.x.queries]
         if len(handles) != len(set(handles)) or len(names) != len(set(names)):
             raise ValueError("Account handles and query names in sources.yaml must be unique")
+        feeds = [feed.name for feed in self.rss.feeds]
+        if len(feeds) != len(set(feeds)):
+            raise ValueError("RSS feed names in sources.yaml must be unique")
         return self
 
 

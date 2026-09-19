@@ -64,6 +64,8 @@ class SourceFetch(DomainModel):
     items: tuple[RawSourceItem, ...] = ()
     cursor: str | None = None
     error_code: str | None = None
+    # Source-specific diagnostic counters (e.g. files_checked), stored in pipeline_metrics as-is.
+    stats: dict[str, int] = Field(default_factory=dict)
 
 
 class EventCandidate(RawSourceItem):

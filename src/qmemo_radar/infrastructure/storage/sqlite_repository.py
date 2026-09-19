@@ -11,6 +11,7 @@ import aiosqlite
 
 from qmemo_radar.application.ports import KnownEvents
 from qmemo_radar.domain import (
+    SHARED_URL_SOURCES,
     CostEntry,
     DeliveryKind,
     Draft,
@@ -20,7 +21,6 @@ from qmemo_radar.domain import (
     EventStatus,
     FactCheckStatus,
     FeedbackAction,
-    Metric,
     OutboxStatus,
     PipelineCounters,
     PipelineRun,
@@ -114,9 +114,12 @@ class SQLiteEventRepository:
                     (source, *external_ids),
                 )
                 ids.update((source, str(row[0])) for row in rows)
+                if source in SHARED_URL_SOURCES:
+                    continue  # not a duplicate key, and the URL index does not cover this source
                 group_urls = [str(event.url) for event in group]
                 rows = await db.execute_fetchall(
-                    f"SELECT url FROM radar_events WHERE source = ? "
+                    # `source != 'gdelt'` lets SQLite use the partial index idx_events_source_url.
+                    f"SELECT url FROM radar_events WHERE source = ? AND source != 'gdelt' "
                     f"AND url IN ({_placeholders(group_urls)})",
                     (source, *group_urls),
                 )
@@ -156,11 +159,11 @@ class SQLiteEventRepository:
         return {str(status): int(count) for status, count in rows}
 
     async def record_metrics(
-        self, run_id: str, metrics: Mapping[str, Mapping[Metric, int]]
+        self, run_id: str, metrics: Mapping[str, Mapping[str, int]]
     ) -> None:
         now = datetime.now(UTC).isoformat()
         rows = [
-            (run_id, source_key, metric.value, value, now)
+            (run_id, source_key, str(metric), value, now)
             for source_key, values in metrics.items()
             for metric, value in values.items()
             if value
@@ -233,7 +236,9 @@ class SQLiteEventRepository:
                 """
                 SELECT * FROM radar_events
                 WHERE status = ?
-                ORDER BY discovered_at ASC
+                -- Newest first: a large free-source backlog must not starve fresh candidates;
+                -- older ones expire by TTL.
+                ORDER BY discovered_at DESC
                 LIMIT ?
                 """,
                 (status.value, limit),
@@ -540,6 +545,28 @@ class SQLiteEventRepository:
             )
             await db.commit()
             return cursor.rowcount == 1
+
+    async def sample_events(
+        self, source: str, *, limit: int, random: bool
+    ) -> list[dict[str, object]]:
+        """Newest (or random) stored items of a source (`gdelt`) or source key (`rss:wire`).
+
+        Opens the file read-only: this can neither migrate nor change the database.
+        """
+        column = "source_key" if ":" in source else "source"
+        order = "RANDOM()" if random else "rowid DESC"
+        async with aiosqlite.connect(f"{self._db_path.resolve().as_uri()}?mode=ro", uri=True) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await db.execute_fetchall(
+                f"""
+                SELECT source, source_key, status, filter_reason, published_at, discovered_at,
+                       author_handle, author_display_name, language, original_text, url,
+                       json_extract(raw_payload_json, '$.title') AS title
+                FROM radar_events WHERE {column} = ? ORDER BY {order} LIMIT ?
+                """,
+                (source, limit),
+            )
+        return [dict(row) for row in rows]
 
     async def get_state(self, key: str) -> str | None:
         async with self._connect() as db:

@@ -15,6 +15,11 @@ class SourceType(StrEnum):
     MANUAL = "manual"
 
 
+# Sources whose items share a URL (GDELT: one item per quote of an article). Their URL is not a
+# duplicate key; the partial unique index in migration 009 must list the same sources.
+SHARED_URL_SOURCES = frozenset({SourceType.GDELT})
+
+
 class Metric(StrEnum):
     """Flow metrics stored per run and source in `pipeline_metrics`."""
 
@@ -23,6 +28,7 @@ class Metric(StrEnum):
     EXACT_DUPLICATES = "exact_duplicates"  # already stored, or identical text to an earlier item
     FILTERED = "filtered"  # rejected by deterministic rules
     SOURCE_ERRORS = "source_errors"
+    INVALID_ITEMS = "invalid_items"  # could not be normalized or stored (e.g. broken Unicode)
     # Reserved names for the future preselection chain; nothing records them yet.
     NEAR_DUPLICATES = "near_duplicates"
     CLUSTERS_CREATED = "clusters_created"

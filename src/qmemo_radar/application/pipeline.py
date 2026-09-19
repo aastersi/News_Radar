@@ -1,3 +1,4 @@
+import json
 import logging
 from collections import Counter, defaultdict
 from collections.abc import Sequence
@@ -14,6 +15,7 @@ from qmemo_radar.application.normalization import build_candidate
 from qmemo_radar.application.ports import EventRepository, Ranker, SourceCollector
 from qmemo_radar.application.scoring import calculate_total
 from qmemo_radar.domain import (
+    SHARED_URL_SOURCES,
     EventCandidate,
     EventStatus,
     Metric,
@@ -57,11 +59,12 @@ class RadarPipeline:
 
     async def run_once(self, *, run_id: str | None = None) -> PipelineCounters:
         run_id = run_id or uuid4().hex
-        metrics: defaultdict[str, Counter[Metric]] = defaultdict(Counter)
+        metrics: defaultdict[str, Counter[str]] = defaultdict(Counter)
         checkpoints = await self._repository.get_checkpoints()
         for fetch in await self._collector.collect(checkpoints):
             log = {"run_id": run_id, "operation": "collect", "source_key": fetch.source_key}
             stats = metrics[fetch.source_key]
+            stats.update(fetch.stats)
             if fetch.error_code:
                 stats[Metric.SOURCE_ERRORS] += 1
                 await self._repository.record_source_result(
@@ -196,14 +199,21 @@ class RadarPipeline:
                 counters.archived += 1
         return True
 
-    async def _ingest(self, items: Sequence[RawSourceItem], stats: Counter[Metric]) -> None:
+    async def _ingest(self, items: Sequence[RawSourceItem], stats: Counter[str]) -> None:
         """Stage 1 for one chunk: normalize, screen, drop exact duplicates, insert in one commit.
 
         Future stages (near dedup, clustering, preselection) read DISCOVERED events after this
         and before ranking; they must not be added here.
         """
         now = datetime.now(UTC)
-        events = [build_candidate(item, discovered_at=now) for item in items]
+        events: list[EventCandidate] = []
+        for item in items:
+            try:
+                events.append(_storable(build_candidate(item, discovered_at=now)))
+            except ValueError:
+                # One bad upstream item must not abort the run: the cursor would never move and
+                # every run would fail on it again.
+                stats[Metric.INVALID_ITEMS] += 1
         known = await self._repository.find_known(events)
         ids, urls = set(known.ids), set(known.urls)
         owners = dict(known.content_owners)
@@ -211,11 +221,13 @@ class RadarPipeline:
         for event in events:
             id_key = (event.source.value, event.external_id)
             url_key = (event.source.value, str(event.url))
-            if id_key in ids or url_key in urls:
+            shared_url = event.source in SHARED_URL_SOURCES
+            if id_key in ids or (not shared_url and url_key in urls):
                 stats[Metric.EXACT_DUPLICATES] += 1
                 continue
             ids.add(id_key)
-            urls.add(url_key)
+            if not shared_url:
+                urls.add(url_key)
             reason = first_filter_reason(event, self._filter_policy, now=now)
             original = None if reason else owners.get(event.content_hash)
             if original:
@@ -244,6 +256,15 @@ class RadarPipeline:
         return EventStatus.ARCHIVED
 
 
+def _storable(event: EventCandidate) -> EventCandidate:
+    """Raise UnicodeEncodeError (a ValueError) for text SQLite cannot store, e.g. a lone
+    surrogate decoded from a JSON escape."""
+    texts = (event.original_text, event.author_handle, event.author_display_name, event.language)
+    "".join(text or "" for text in texts).encode()
+    json.dumps(event.raw_payload, ensure_ascii=False, default=str).encode()
+    return event
+
+
 def _batches[T](items: Sequence[T], *, size: int) -> list[list[T]]:
     return [list(items[index : index + size]) for index in range(0, len(items), size)]
 
@@ -252,8 +273,8 @@ def _metric_for(reason: str) -> Metric:
     return Metric.EXACT_DUPLICATES if reason == DUPLICATE_CONTENT else Metric.FILTERED
 
 
-def _describe(stats: Counter[Metric]) -> str:
-    return " ".join(f"{metric.value}={value}" for metric, value in stats.items() if value)
+def _describe(stats: Counter[str]) -> str:
+    return " ".join(f"{metric}={value}" for metric, value in stats.items() if value)
 
 
 def _validate_results(

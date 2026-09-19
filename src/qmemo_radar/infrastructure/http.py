@@ -85,3 +85,51 @@ def _rate_limit_wait(response: httpx.Response) -> float:
     if reset and reset.strip().isdigit():
         return max(0.0, float(reset) - time.time())
     return 1.0
+
+
+async def get_limited(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    max_bytes: int,
+    headers: Mapping[str, str] | None = None,
+    attempts: int = 3,
+    sleep: Sleep = asyncio.sleep,
+) -> tuple[httpx.Response, bytes]:
+    """GET that stops reading once the body exceeds `max_bytes` (HttpFailure response_too_large).
+
+    Network errors, 5xx and 429 are retried like `send_with_retry` and end in HttpFailure; every
+    other status (200, 3xx, 304, 404, other 4xx) is returned for the caller to interpret. Redirects
+    are never followed here. The body is the decoded content, so the limit also caps what a
+    compressed Content-Encoding expands to (overshoot at most one decoded chunk).
+    """
+    for attempt in range(1, attempts + 1):
+        last = attempt == attempts
+        failure: HttpFailure
+        try:
+            async with client.stream("GET", url, headers=headers) as response:
+                status = response.status_code
+                if status == 429 or status >= 500:
+                    code = "rate_limited" if status == 429 else "server_error"
+                    failure = HttpFailure(code, status)
+                else:
+                    declared = response.headers.get("content-length", "")
+                    if declared.isdigit() and int(declared) > max_bytes:
+                        raise HttpFailure("response_too_large", status)
+                    body = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        body += chunk
+                        if len(body) > max_bytes:
+                            raise HttpFailure("response_too_large", status)
+                    return response, bytes(body)
+        except httpx.TransportError as exc:
+            failure = HttpFailure("network_error")
+            failure.__cause__ = exc
+        logger.warning(
+            "http request failed",
+            extra={"operation": "http", "result": "retry", "error_code": str(failure)},
+        )
+        if last:
+            raise failure
+        await sleep(float(2 ** (attempt - 1)))
+    raise AssertionError("unreachable")

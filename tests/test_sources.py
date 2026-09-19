@@ -4,6 +4,7 @@ import sqlite3
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 import httpx
 import pytest
@@ -268,3 +269,233 @@ async def test_copy_of_an_ignored_original_is_stored_without_a_dangling_link(
             "SELECT id, external_id, duplicate_of_event_id FROM radar_events ORDER BY rowid"
         ).fetchall()
     assert rows == [(stored.event_id, "rss-1", None), (copy.event_id, "gdelt-2", None)]
+
+
+async def test_quotes_of_one_article_share_its_url_but_other_sources_do_not(
+    repository: SQLiteEventRepository,
+) -> None:
+    def quote(source: SourceType, number: int) -> RawSourceItem:
+        return article(source, number).model_copy(
+            update={
+                "url": "https://news.example/story",
+                "original_text": f"{source.value} quote {number} " * 3,
+            }
+        )
+
+    gdelt = Feed("gdelt:gqg", [quote(SourceType.GDELT, 1), quote(SourceType.GDELT, 2)])
+    rss = Feed("rss:wire", [quote(SourceType.RSS, 1), quote(SourceType.RSS, 2)])
+
+    counters = await pipeline(MultiSourceCollector({"g": gdelt, "r": rss}), repository).run_once()
+
+    assert (counters.inserted, counters.duplicates) == (3, 1)
+    with sqlite3.connect(repository._db_path) as db:
+        rows = db.execute("SELECT source, COUNT(*) FROM radar_events GROUP BY source").fetchall()
+        assert rows == [("gdelt", 2), ("rss", 1)]
+        # The database, not only the pipeline, still rejects a second RSS row with that URL.
+        with pytest.raises(sqlite3.IntegrityError, match="source, radar_events.url"):
+            db.execute(
+                "INSERT INTO radar_events (id, source, external_id, url, original_text,"
+                " normalized_text, content_hash, published_at, discovered_at, status,"
+                " created_at, updated_at) SELECT 'copy', source, 'other', url, original_text,"
+                " normalized_text, content_hash, published_at, discovered_at, status,"
+                " created_at, updated_at FROM radar_events WHERE source = 'rss'"
+            )
+
+
+async def test_upgrade_to_shared_quote_urls_keeps_rows_and_children(tmp_path: Path) -> None:
+    from importlib.resources import files
+
+    path = tmp_path / "old.db"
+    migrations = sorted(
+        item
+        for item in files("qmemo_radar.infrastructure.storage.migrations").iterdir()
+        if item.name.endswith(".sql") and int(item.name[:3]) <= 8
+    )
+    with sqlite3.connect(path) as db:
+        for migration in migrations:
+            db.executescript(migration.read_text(encoding="utf-8"))
+    old = SQLiteEventRepository(path)
+    first = build_candidate(article(SourceType.RSS, 1))
+    copy = build_candidate(article(SourceType.RSS, 2)).model_copy(
+        update={"duplicate_of_event_id": first.event_id}
+    )
+    assert await old.add_events([first, copy]) == 2
+    with sqlite3.connect(path) as db:
+        db.execute(
+            "INSERT INTO feedback (event_id, action, telegram_user_id, created_at)"
+            " VALUES (?, 'SKIP', 1, 'now')",
+            (first.event_id,),
+        )
+
+    await SQLiteEventRepository(path).initialize()
+
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone() == (9,)
+        assert db.execute(
+            "SELECT rowid, id, duplicate_of_event_id FROM radar_events ORDER BY rowid"
+        ).fetchall() == [(1, first.event_id, None), (2, copy.event_id, first.event_id)]
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert db.execute("SELECT event_id FROM feedback").fetchall() == [(first.event_id,)]
+        indexes = {row[1] for row in db.execute("PRAGMA index_list(radar_events)")}
+    assert {"idx_events_source_url", "idx_events_content_hash", "idx_events_duplicate_of"} <= set(
+        indexes
+    )
+
+
+async def test_gdelt_and_rss_run_together_free_while_paid_x_is_blocked(
+    repository: SQLiteEventRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import gzip
+    import json
+
+    from qmemo_radar.application.budget import month_start
+    from qmemo_radar.infrastructure.collectors import rss as rss_module
+
+    async def public(host: str, port: int) -> list[str]:
+        return ["93.184.216.34"]
+
+    monkeypatch.setattr(rss_module, "_resolve", public)
+    now = datetime.now(UTC)
+    quote = {
+        "date": now.isoformat(),
+        "url": "https://news.example/gdelt",
+        "title": "Budget",
+        "lang": "ENGLISH",
+        "quotes": [{"pre": "", "quote": "The budget is final and it will not change", "post": ""}],
+    }
+    feed = (
+        "<rss><channel><item><title>A fresh headline for the radar today</title>"
+        f"<link>https://news.example/rss</link><pubDate>{now:%a, %d %b %Y %H:%M:%S} +0000"
+        "</pubDate></item></channel></rss>"
+    ).encode()
+    requests: list[str] = []
+
+    def web(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.host)
+        if request.url.host == "data.gdeltproject.org":
+            return httpx.Response(200, content=gzip.compress(json.dumps(quote).encode()))
+        if request.url.host == "wire.example":
+            return httpx.Response(200, content=feed)
+        return httpx.Response(599)  # X must never be reached
+
+    # The month's paid budget is already used up.
+    spent = CostEntry(
+        provider="x", operation="earlier", units=1, estimated_cost_usd=Decimal(10), created_at=now
+    )
+    assert await repository.reserve_cost(spent, since=month_start(now), limit_usd=Decimal(10))
+    guard = BudgetGuard(
+        repository,
+        enabled=frozenset(PaidFeature),
+        hard_limit_usd=Decimal(10),
+        target_usd=Decimal(0),
+    )
+    transport = httpx.MockTransport(web)
+    sources = X_SOURCES.model_copy(
+        update={
+            "rss": SourcesConfig.model_validate(
+                {"rss": {"feeds": [{"name": "wire", "url": "https://wire.example/rss"}]}}
+            ).rss
+        }
+    )
+    config = settings(
+        **X_ON, gdelt_enabled=True, collect_interval_minutes=5, gdelt_max_minutes_per_run=5
+    )
+    context = SourceContext(
+        config,
+        sources,
+        XApiClient(httpx.AsyncClient(transport=transport), guard=guard),
+        free_http=httpx.AsyncClient(transport=transport),
+    )
+    collector = build_collector(context)
+    assert collector.names == ["x_search", "gdelt_gqg", "rss"]
+
+    counters = await pipeline(collector, repository).run_once()
+
+    assert counters.inserted == 2  # the GDELT quote (same in every file) and the RSS entry
+    assert counters.source_errors == 2  # the two X queries, blocked before any request
+    assert "api.x.com" not in requests
+    assert await repository.cost_since(month_start(now)) == Decimal(10)  # nothing added
+    with sqlite3.connect(repository._db_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM cost_ledger").fetchone() == (1,)
+
+
+async def test_free_sources_alone_never_touch_the_cost_ledger(
+    repository: SQLiteEventRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from qmemo_radar.application.budget import month_start
+    from qmemo_radar.infrastructure.collectors import rss as rss_module
+
+    async def public(host: str, port: int) -> list[str]:
+        return ["93.184.216.34"]
+
+    monkeypatch.setattr(rss_module, "_resolve", public)
+    sources = SourcesConfig.model_validate(
+        {"rss": {"feeds": [{"name": "wire", "url": "https://wire.example/rss"}]}}
+    )
+    config = settings(gdelt_enabled=True, collect_interval_minutes=5, gdelt_max_minutes_per_run=5)
+    http = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(404)))
+    collector = build_collector(SourceContext(config, sources, x_client=None, free_http=http))
+
+    await pipeline(collector, repository).run_once()
+
+    assert collector.names == ["gdelt_gqg", "rss"]
+    assert await repository.cost_since(month_start(datetime.now(UTC))) == Decimal(0)
+
+
+async def test_a_free_source_backlog_does_not_starve_fresh_candidates(
+    repository: SQLiteEventRepository,
+) -> None:
+    # Regression: only the 100 oldest DISCOVERED events were re-checked and ranked, so a GDELT
+    # backlog of thousands kept every new item from reaching the ranker.
+    from qmemo_radar.exceptions import RankingFailed
+
+    earlier = datetime.now(UTC) - timedelta(hours=5)
+    backlog = [
+        build_candidate(article(SourceType.GDELT, n), discovered_at=earlier) for n in range(150)
+    ]
+    assert await repository.add_events(backlog) == 150
+    seen: list[str] = []
+
+    class Recording:
+        async def rank(self, events: object) -> list[object]:
+            seen.extend(event.external_id for event in events)  # type: ignore[attr-defined]
+            raise RankingFailed("provider_down", retryable=True)
+
+    fresh = Feed("rss:wire", [article(SourceType.RSS, 1)])
+    radar = pipeline(MultiSourceCollector({"rss": fresh}), repository)
+    radar._ranker = Recording()  # type: ignore[assignment]
+
+    await radar.run_once()
+
+    assert seen[0] == "rss-1"
+
+
+async def test_url_duplicate_lookup_uses_the_partial_index(
+    repository: SQLiteEventRepository,
+) -> None:
+    statements: list[str] = []
+    events = [build_candidate(article(SourceType.RSS, 1))]
+    original = repository._connect
+
+    def tracing() -> object:
+        context = original()
+
+        class Traced:
+            async def __aenter__(self) -> object:
+                db = await context.__aenter__()
+                await db.set_trace_callback(statements.append)
+                return db
+
+            async def __aexit__(self, *exc: object) -> None:
+                await context.__aexit__(*exc)
+
+        return Traced()
+
+    repository._connect = tracing  # type: ignore[method-assign]
+    await repository.find_known(events)
+    repository._connect = original  # type: ignore[method-assign]
+
+    [lookup] = [sql for sql in statements if "url IN" in sql]
+    with sqlite3.connect(repository._db_path) as db:
+        plan = " ".join(str(row[-1]) for row in db.execute(f"EXPLAIN QUERY PLAN {lookup}"))
+    assert "idx_events_source_url" in plan

@@ -12,7 +12,6 @@ from qmemo_radar.domain import (
     EventCandidate,
     EventStatus,
     FeedbackAction,
-    Metric,
     OutboxStatus,
     PipelineCounters,
     PipelineRun,
@@ -61,8 +60,10 @@ class EventRepository(Protocol):
         ...
 
     async def record_metrics(
-        self, run_id: str, metrics: Mapping[str, Mapping[Metric, int]]
-    ) -> None: ...
+        self, run_id: str, metrics: Mapping[str, Mapping[str, int]]
+    ) -> None:
+        """Metric names are `Metric` members or a source's own diagnostic counters."""
+        ...
 
     async def metrics_since(self, since: datetime) -> dict[str, dict[str, int]]: ...
 
